@@ -1,0 +1,34 @@
+### ЖУРНАЛ ПРОЕКТА YARILO — ОБНОВЛЁННАЯ ВЕРСИЯ
+Дата: 22.12.2025
+Версия журнала: v3.3
+
+Сделано за всё время:
+• Workspace на wgpu 28.0.0 + свежие зависимости
+• yarilo-core: offscreen wgpu + staging copy + gbm map_mut + page_flip (зелёный экран работает)
+• yarilo-runner: supervisor
+• aurora-compositor: один бинарник
+• yarilo-x11: Connection Setup Success
+• Scene graph (Arc<RwLock<Vec<Layer>>>) + композиция
+• Layer pub + чистка тестового окна в x11
+
+Текущий спринт / ближайшие задачи:
+• Передача Arc<YariloCore> из supervisor в x11 task
+• Реальный парсер CreateWindow + создание texture + push в layers
+• MapWindow + PolyFillRectangle
+
+Критические архитектурные решения (никогда не меняй):
+• Один бинарник aurora-compositor — один процесс, одна точка входа
+• Встроенный минимальный X11-сервер в panic-restartable task (НЕ Xwayland)
+• Полная одновременная совместимость с Wayland и X11 без перекомпиляции приложений
+• Рендеринг через wgpu offscreen primary, Zink для legacy OpenGL
+• Прямой DRM/KMS scanout через GBM BO + atomic page_flip
+• Работает на Linux + все *BSD из коробки с 1.0
+• Yarilo Protocol v1 как будущее "Wayland 2.0"
+
+Следующие предлагаемые шаги:
+1. Почистить код (убрать тестовое окно и заглушку spawn в core — код выше)
+2. В supervisor: после создания core — передать Arc<core> в x11 task через tokio::sync::oneshot или mpsc
+3. В yarilo-x11: run_x11_server принимать Arc<YariloCore>
+4. В handle_client: использовать core.device/queue/layers для CreateWindow
+5. Парсер opcode 1 (CreateWindow) + создать texture по w/h/depth/bpp
+6. Тест: xclock нативно поверх зелёного

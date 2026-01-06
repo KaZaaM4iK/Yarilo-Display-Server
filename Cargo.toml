@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/aurora-compositor",
+    "crates/yarilo-core",
+    "crates/yarilo-wayland",
+    "crates/yarilo-x11",
+    "crates/yarilo-protocol",
+    "crates/yarilo-plugins",
+    "crates/yarilo-runner",
+]
+resolver = "2"
+
+[workspace.dependencies]
+wgpu = "28.0.0"
+tokio-uring = "0.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+drm = { version = "0.14.1", features = ["libseat"] }
+gbm = "0.18.0"
+libseat = "0.2.4"
+anyhow = "1.0.100"
+raw-window-handle = "0.6.2"

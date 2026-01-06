@@ -1,0 +1,12 @@
+[package]
+name = "yarilo-runner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+yarilo-core = { path = "../yarilo-core" }
+yarilo-x11 = { path = "../yarilo-x11" }
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+futures = "0.3.31"
