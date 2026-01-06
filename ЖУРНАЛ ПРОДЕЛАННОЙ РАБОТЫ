@@ -1,23 +1,26 @@
 ### ЖУРНАЛ ПРОЕКТА YARILO — ОБНОВЛЁННАЯ ВЕРСИЯ
 Дата: 06.01.2026
-Версия журнала: v1.3
+Версия журнала: v1.5
 
 Сделано за всё время:
 • Скелет workspace с правильной структурой crates
 • yarilo-core: DRM/KMS + GBM + wgpu offscreen + double buffer page_flip
 • yarilo-x11: Connection Setup, CreateWindow с clear_to_black
-• Damage-driven композитинг с правильным alignment (padded_bpr)
+• Damage-driven композитинг с alignment (padded_bpr)
 • PutImage (ZPixmap depth 24) с padding
 • ConfigureWindow полный: move + resize с пересозданием текстуры
 • GetImage reply
-• DAMAGE extension базовая (mark_damaged на любое событие)
-• Unmap/DestroyWindow
+• DAMAGE extension базовая
+• GLX extension: Query*/CreateContext/MakeCurrent/SwapBuffers
+• wgpu::Surface из GBM surface (raw-window-handle + unsafe)
+• present_gl_surface: copy surface texture → Layer.texture → mark_damaged
+• glxgears/glxinfo работают через Zink
 • Один бинарник aurora-compositor
 
 Текущий спринт / ближайшие задачи:
-• GLX extension через Zink (wgpu surface из GBM BO)
-• MakeCurrent/SwapBuffers для OpenGL-клиентов
-• Полная совместимость glxgears/glxinfo
+• Ре-конфиг GL surface при ресайзе окна
+• Обработка SurfaceError::Outdated
+• Полная стабильность GLX при move/resize
 
 Критические архитектурные решения (никогда не меняй):
 • Один бинарник — aurora-compositor — одна точка входа, один процесс
@@ -29,7 +32,7 @@
 • Структура crates остаётся строго как сейчас
 
 Следующие предлагаемые шаги:
-1. Реализуем GLX extension через Zink (как описано выше)
-2. Тестирование OpenGL-клиентов (glxgears, glxinfo, firefox)
-3. Реализация RENDER extension для ускорения 2D
+1. ChatGPT фиксит ре-конфиг surface при ресайзе + Outdated error (как выше)
+2. Тестирование стабильности GLX при ресайзе/перемещении
+3. RENDER extension (Picture + Composite для 2D ускорения)
 4. Начало yarilo-wayland: wl_display + wl_compositor + wl_surface
