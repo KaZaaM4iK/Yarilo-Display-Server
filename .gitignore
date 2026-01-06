@@ -1,3 +1,15 @@
+# ===== Cargo / Rust =====
 /target
+/debug
 **/*.rs.bk
-Cargo.lock
+*.pdb
+**/mutants.out*/
+
+# ===== Project-specific =====
+# Пока проект в активной разработке — lock не коммитим
+/Cargo.lock
+
+# ===== IDE / Editor =====
+.idea/
+*.swp
+*.log
