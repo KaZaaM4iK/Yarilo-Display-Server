@@ -1,22 +1,23 @@
 ### ЖУРНАЛ ПРОЕКТА YARILO — ОБНОВЛЁННАЯ ВЕРСИЯ
 Дата: 06.01.2026
-Версия журнала: v1.2
+Версия журнала: v1.3
 
 Сделано за всё время:
 • Скелет workspace с правильной структурой crates
 • yarilo-core: DRM/KMS + GBM + wgpu offscreen + double buffer page_flip
-• yarilo-x11: Connection Setup, CreateWindow → wgpu texture + Layer с clear_to_black
-• Damage-driven композитинг: Z-order, частичное обновление
-• PutImage (ZPixmap depth 24) → software X11 работает
-• Unmap/DestroyWindow → удаление слоёв
-• ConfigureWindow → минимальная поддержка + mark_damaged
-• CopyArea/PolyFillRectangle → mark_damaged
+• yarilo-x11: Connection Setup, CreateWindow с clear_to_black
+• Damage-driven композитинг с правильным alignment (padded_bpr)
+• PutImage (ZPixmap depth 24) с padding
+• ConfigureWindow полный: move + resize с пересозданием текстуры
+• GetImage reply
+• DAMAGE extension базовая (mark_damaged на любое событие)
+• Unmap/DestroyWindow
 • Один бинарник aurora-compositor
 
 Текущий спринт / ближайшие задачи:
-• Полная ConfigureWindow с ресайзом текстур
-• DAMAGE extension (базовая поддержка)
-• GetImage reply для корректных клиентов
+• GLX extension через Zink (wgpu surface из GBM BO)
+• MakeCurrent/SwapBuffers для OpenGL-клиентов
+• Полная совместимость glxgears/glxinfo
 
 Критические архитектурные решения (никогда не меняй):
 • Один бинарник — aurora-compositor — одна точка входа, один процесс
@@ -28,7 +29,7 @@
 • Структура crates остаётся строго как сейчас
 
 Следующие предлагаемые шаги:
-1. Реализуем полный ConfigureWindow + resize слоёв + базовый DAMAGE extension (как выше)
-2. Тестирование ресайза и нескольких перекрывающихся окон
-3. Реализация DAMAGE для sub-region композитинга (оптимизация)
-4. Начало GLX → Zink (GLX context → wgpu surface)
+1. Реализуем GLX extension через Zink (как описано выше)
+2. Тестирование OpenGL-клиентов (glxgears, glxinfo, firefox)
+3. Реализация RENDER extension для ускорения 2D
+4. Начало yarilo-wayland: wl_display + wl_compositor + wl_surface
