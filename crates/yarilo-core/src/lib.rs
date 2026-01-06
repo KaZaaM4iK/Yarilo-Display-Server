@@ -32,6 +32,7 @@ pub struct Layer {
     width: u32,
     height: u32,
     z: u32,
+    damaged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +71,92 @@ impl Layer {
             width,
             height,
             z,
+            damaged: true,
         }
+    }
+
+    pub fn is_damaged(&self) -> bool {
+        self.damaged
+    }
+
+    pub fn mark_damaged(&mut self) {
+        self.damaged = true;
+    }
+
+    pub fn clear_damage(&mut self) {
+        self.damaged = false;
+    }
+
+    pub fn clear_to_black(&self, device: &Device, queue: &Queue) {
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("Layer Clear To Black"),
+        });
+
+        {
+            encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Layer Clear Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn set_position(&mut self, x: u32, y: u32) {
+        self.x = x;
+        self.y = y;
+    }
+
+    /// ВАЖНО: очередь нужна для submit (wgpu::Device не имеет submit).
+    /// Поэтому сигнатура принимает и queue, иначе "clear_to_black на новой" невыполнимо.
+    pub fn resize(&mut self, new_width: u32, new_height: u32, device: &Device, queue: &Queue) {
+        if new_width == 0 || new_height == 0 {
+            return;
+        }
+        if self.width == new_width && self.height == new_height {
+            return;
+        }
+
+        self.width = new_width;
+        self.height = new_height;
+
+        let texture_desc = wgpu::TextureDescriptor {
+            label: Some("Layer Texture (Resized)"),
+            size: wgpu::Extent3d {
+                width: new_width,
+                height: new_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+
+        self.texture = device.create_texture(&texture_desc);
+        self.view = self
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.clear_to_black(device, queue);
+        self.mark_damaged();
     }
 
     pub fn texture(&self) -> &wgpu::Texture {
@@ -276,10 +362,10 @@ impl YariloCore {
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        info!("YARILO LOOP STARTED — offscreen + GBM double buffer flip");
+        info!("YARILO LOOP STARTED — compositing with damage tracking");
 
-        let texture_desc = wgpu::TextureDescriptor {
-            label: Some("Offscreen Framebuffer"),
+        let offscreen_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Offscreen Compositor Target"),
             size: wgpu::Extent3d {
                 width: self.width,
                 height: self.height,
@@ -289,41 +375,42 @@ impl YariloCore {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Bgra8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        };
-        let offscreen_texture = self.device.create_texture(&texture_desc);
-        let offscreen_view = offscreen_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let layers_for_x11 = self.layers.clone();
+        });
+        let offscreen_view = offscreen_texture.create_view(&Default::default());
 
-        // Staging buffer для copy texture → CPU → mmap BO (простой путь)
+        let unpadded_bpr = self.width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u32;
+        let padded_bpr = ((unpadded_bpr + (align - 1)) / align) * align;
+
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: (self.width * self.height * 4) as u64,
+            label: Some("Compositor Staging Buffer"),
+            size: (padded_bpr as u64) * (self.height as u64),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
-        loop {
+        // 1) Инициализируем базовый фон ОДИН РАЗ.
+        // Дальше offscreen считается "живым" и обновляется только по damage.
+        {
             let mut encoder = self
                 .device
-                .create_command_encoder(&CommandEncoderDescriptor::default());
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("Compositor Init Encoder"),
+                });
 
-            // Рендер зелёного в offscreen
             {
-                let _pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("Green Clear"),
+                encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Initial Background Clear"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: &offscreen_view,
                         resolve_target: None,
                         depth_slice: None,
                         ops: Operations {
-                            load: LoadOp::Clear(Color {
-                                r: 0.0,
-                                g: 0.5,
-                                b: 0.0,
-                                a: 1.0,
-                            }),
+                            load: LoadOp::Clear(Color::GREEN),
                             store: StoreOp::Store,
                         },
                     })],
@@ -334,7 +421,69 @@ impl YariloCore {
                 });
             }
 
-            // Copy offscreen → staging
+            self.queue.submit(Some(encoder.finish()));
+        }
+
+        loop {
+            // 2) Ищем первый damaged слой снизу вверх.
+            // Если повреждён нижний слой — обязаны "переаплаить" все слои выше, иначе нижний перезатрёт верхний.
+            let first_damaged_index = {
+                let layers = self.layers.read();
+                layers.iter().position(|l| l.is_damaged())
+            };
+
+            // Нет damage — ничего не трогаем, не гоняем staging/page_flip.
+            if first_damaged_index.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+                continue;
+            }
+
+            let first_damaged_index = first_damaged_index.unwrap();
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("Compositor Encoder"),
+                });
+
+            // 3) Композитинг: соблюдаем Z-order (порядок вектора, последний сверху).
+            // Обновляем минимально безопасный диапазон: от первого damaged слоя и до конца.
+            {
+                let mut layers = self.layers.write();
+
+                for i in first_damaged_index..layers.len() {
+                    let layer = &mut layers[i];
+
+                    encoder.copy_texture_to_texture(
+                        TexelCopyTextureInfo {
+                            texture: layer.texture(),
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        TexelCopyTextureInfo {
+                            texture: &offscreen_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: layer.position().0,
+                                y: layer.position().1,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: layer.size().0,
+                            height: layer.size().1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+
+                    // После переаплая считаем слой "чистым".
+                    layer.clear_damage();
+                }
+            }
+
+            // 4) offscreen → staging
             encoder.copy_texture_to_buffer(
                 TexelCopyTextureInfo {
                     texture: &offscreen_texture,
@@ -346,7 +495,7 @@ impl YariloCore {
                     buffer: &staging_buffer,
                     layout: TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(4 * self.width),
+                        bytes_per_row: Some(padded_bpr),
                         rows_per_image: Some(self.height),
                     },
                 },
@@ -357,62 +506,36 @@ impl YariloCore {
                 },
             );
 
-            // Композиция слоёв (пока пусто, потом X11 окна)
-            for layer in self.layers.read().iter() {
-                encoder.copy_texture_to_texture(
-                    TexelCopyTextureInfo {
-                        texture: &layer.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    TexelCopyTextureInfo {
-                        texture: &offscreen_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: layer.x,
-                            y: layer.y,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: layer.width,
-                        height: layer.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-
             self.queue.submit(Some(encoder.finish()));
 
-            // Map staging и copy в mmap'нутый BO
-            let buffer_slice = staging_buffer.slice(..);
-            buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
+            // 5) CPU copy → GBM back buffer
+            let slice = staging_buffer.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| ());
             let _ = self.device.poll(PollType::Wait {
                 submission_index: None,
                 timeout: None,
             });
-            let data = buffer_slice.get_mapped_range();
+            let data = slice.get_mapped_range();
+
             {
                 let mut back = self.gbm_bo_back.lock();
-                back.map_mut(
-                    0,
-                    0,
-                    self.width,
-                    self.height,
-                    |map: &mut gbm::MappedBufferObject<'_, ()>| {
-                        let dst = map.buffer_mut();
-                        dst[..data.len()].copy_from_slice(&data);
-                    },
-                )?;
-            } // back guard дропнет
+                back.map_mut(0, 0, self.width, self.height, |map| {
+                    let dst = map.buffer_mut();
+                    let row_bytes = (self.width * 4) as usize;
+                    let src_stride = padded_bpr as usize;
+
+                    for row in 0..(self.height as usize) {
+                        let src_off = row * src_stride;
+                        let dst_off = row * row_bytes;
+                        dst[dst_off..dst_off + row_bytes]
+                            .copy_from_slice(&data[src_off..src_off + row_bytes]);
+                    }
+                })?;
+            }
 
             drop(data);
             staging_buffer.unmap();
 
-            // Page flip
-            // Page flip
             let fb = {
                 let back = self.gbm_bo_back.lock();
                 self.drm_dev.add_framebuffer(&*back, 24, 32)?
@@ -421,7 +544,6 @@ impl YariloCore {
             self.drm_dev
                 .page_flip(self.crtc, fb, drm::control::PageFlipFlags::EVENT, None)?;
 
-            // Swap back buffer
             {
                 let mut front = self.gbm_bo_front.lock();
                 let mut back = self.gbm_bo_back.lock();
