@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/yarilo_wm.dir/link.d CMakeFiles/yarilo_wm.dir/tools/wm_test.cpp.o -o yarilo_wm

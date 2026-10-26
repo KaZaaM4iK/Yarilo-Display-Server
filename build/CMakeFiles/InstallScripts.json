@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/tank/data/project/Yarilo/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
