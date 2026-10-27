@@ -278,7 +278,7 @@ core::Result<DestroySurfaceResult> SurfaceManager::destroy_surface(uint32_t sess
 
     try {
         result.releases.reserve(s.attached_bindings.size());
-        result.server_uid = s.server_uid; // Защита от ABA
+        result.server_uid = s.server_uid;
         target_bindings.reserve(s.attached_bindings.size());
         
         for (const auto& [buf_id, b_uid] : s.attached_bindings) {
@@ -562,10 +562,6 @@ core::Result<void> SurfaceManager::apply_wm_configuration(uint64_t global_id, ui
     return {};
 }
 
-// ---------------------------------------------------------
-// Sprint 5 Additions for Window Manager Late Joiner Support
-// ---------------------------------------------------------
-
 std::vector<MapRequestInfo> SurfaceManager::get_pending_map_requests() const {
     std::vector<MapRequestInfo> requests;
     for (const auto& [gid, s] : surfaces_) {
@@ -591,7 +587,57 @@ void SurfaceManager::handle_wm_disconnected() noexcept {
     }
 }
 
-// ---------------------------------------------------------
+std::optional<platform::input::HitTestResult> SurfaceManager::hit_test(double cursor_x, double cursor_y) const noexcept {
+    const Surface* best = nullptr;
+
+    // Zero-allocation однопроходный поиск окна с наивысшим z_index и creation_order
+    for (const auto& [gid, s] : surfaces_) {
+        if (!s.is_mapped_by_wm || s.width == 0 || s.height == 0) continue;
+
+        double sx0 = static_cast<double>(s.x);
+        double sy0 = static_cast<double>(s.y);
+        double sx1 = sx0 + static_cast<double>(s.width);
+        double sy1 = sy0 + static_cast<double>(s.height);
+
+        if (cursor_x >= sx0 && cursor_x < sx1 && cursor_y >= sy0 && cursor_y < sy1) {
+            if (!best) {
+                best = &s;
+            } else if (s.z_index > best->z_index) {
+                best = &s;
+            } else if (s.z_index == best->z_index && s.creation_order > best->creation_order) {
+                best = &s;
+            }
+        }
+    }
+
+    if (best) {
+        return platform::input::HitTestResult{
+            .global_id = best->global_id,
+            .local_id = best->local_id,
+            .session_id = best->owner_session_id,
+            .window_x = best->x,
+            .window_y = best->y
+        };
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<int32_t, int32_t>> SurfaceManager::get_surface_origin(uint64_t gid) const noexcept {
+    auto it = surfaces_.find(gid);
+    if (it != surfaces_.end() && it->second.is_mapped_by_wm) {
+        return std::make_pair(it->second.x, it->second.y);
+    }
+    return std::nullopt;
+}
+
+bool SurfaceManager::surface_exists(uint64_t gid) const noexcept {
+    return surfaces_.contains(gid);
+}
+
+bool SurfaceManager::surface_is_mapped(uint64_t gid) const noexcept {
+    auto it = surfaces_.find(gid);
+    return (it != surfaces_.end() && it->second.is_mapped_by_wm);
+}
 
 core::Result<SnapshotResult> SurfaceManager::take_render_snapshot() {
     struct PendingTransition {
@@ -827,7 +873,6 @@ core::Result<SnapshotResult> SurfaceManager::take_render_snapshot() {
     global_lease_counter_ += staging_nodes.size();
     return result;
 }
-
 
 std::optional<ReleaseInfo> SurfaceManager::release_read_lease(uint64_t lease_id) noexcept {
     auto lease_it = active_leases_.find(lease_id);

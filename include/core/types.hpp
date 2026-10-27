@@ -114,6 +114,9 @@ public:
         if (seat_ && device_id_ >= 0) {
             libseat_close_device(seat_, device_id_);
         }
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
         seat_ = nullptr;
         device_id_ = -1;
         fd_ = -1;

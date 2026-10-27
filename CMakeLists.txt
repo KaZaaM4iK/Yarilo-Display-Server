@@ -10,6 +10,15 @@ add_compile_options(-Wall -Wextra -Wpedantic -Werror=return-type)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(LIBSEAT REQUIRED IMPORTED_TARGET libseat)
+pkg_check_modules(LIBINPUT REQUIRED IMPORTED_TARGET libinput)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    pkg_check_modules(LIBUDEV REQUIRED IMPORTED_TARGET libudev)
+    set(PLATFORM_INPUT_LIBS PkgConfig::LIBUDEV)
+else()
+    # FreeBSD: libinput использует встроенный devd backend или libudev-devd
+    set(PLATFORM_INPUT_LIBS "")
+endif()
 
 # Основной сервер Yarilo
 add_executable(yarilo
@@ -25,6 +34,8 @@ target_include_directories(yarilo PRIVATE include)
 target_link_libraries(yarilo PRIVATE 
     PkgConfig::LIBDRM 
     PkgConfig::LIBSEAT
+    PkgConfig::LIBINPUT
+    ${PLATFORM_INPUT_LIBS}
 )
 
 # Тестовый клиент Yarilo

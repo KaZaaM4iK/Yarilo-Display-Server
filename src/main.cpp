@@ -1,5 +1,6 @@
 #include "platform/seat.hpp"
 #include "platform/drm/output.hpp"
+#include "platform/input/input_subsystem.hpp"
 #include "ipc/server_socket.hpp"
 #include "core/surface.hpp"
 #include "core/geometry.hpp"
@@ -117,11 +118,13 @@ struct SnapshotLeaseDrainer {
     }
 };
 
-static void page_flip_handler(int /*fd*/, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data) {
-    auto* output = static_cast<platform::drm::DrmOutput*>(user_data);
-    if (output) {
-        output->handle_page_flip_event(sequence, tv_sec, tv_usec);
-    }
+static void page_flip_handler(int /*fd*/, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void* user_data) noexcept {
+    try {
+        auto* output = static_cast<platform::drm::DrmOutput*>(user_data);
+        if (output) {
+            output->handle_page_flip_event(sequence, tv_sec, tv_usec);
+        }
+    } catch (...) {}
 }
 
 int main() {
@@ -133,10 +136,10 @@ int main() {
     int exit_code = 0;
 
     std::println("=================================================");
-    std::println("   Yarilo Display Server v0.5 (External WM)      ");
+    std::println("   Yarilo Display Server v0.6 (Input Subsystem)  ");
     std::println("=================================================");
 
-    std::println("[1/5] Initializing seat & KMS output...");
+    std::println("[1/6] Initializing seat & KMS output...");
     
     std::unique_ptr<platform::Seat> seat;
     core::SeatDevice seat_device;
@@ -166,7 +169,7 @@ int main() {
         return exit_code != 0 ? exit_code : 1;
     }
 
-    std::println("[2/5] Initializing IPC Socket...");
+    std::println("[2/6] Initializing IPC Socket...");
     auto socket_res = yarilo::ipc::ServerSocket::create();
     if (!socket_res) {
         std::println(stderr, "Fatal: ServerSocket creation failed: {}", socket_res.error().message());
@@ -178,7 +181,19 @@ int main() {
     auto server_socket = std::move(*socket_res);
     std::println("  -> Server listening on $XDG_RUNTIME_DIR/yarilo-0");
 
-    std::println("[3/5] Ready for Hardware Page-Flipping. Running for 15s...");
+    std::println("[3/6] Initializing Input Subsystem (libinput)...");
+    auto input_res = platform::input::InputSubsystem::create(*seat, output->width(), output->height());
+    if (!input_res) {
+        std::println(stderr, "Fatal: InputSubsystem creation failed: {}", input_res.error().message());
+        auto restore_res = output->restore_crtc(seat->is_active());
+        if (!restore_res) exit_code = 1;
+        output->free_resources();
+        return exit_code != 0 ? exit_code : 1;
+    }
+    auto input_subsystem = std::move(*input_res);
+    std::println("  -> Input Subsystem initialized: Seat admission & Multi-mouse/keyboard active");
+
+    std::println("[4/6] Ready for Hardware Page-Flipping & Input Events. Running for 15s...");
 
     core::SurfaceManager surface_manager;
     std::unordered_map<int, ClientSession> sessions;
@@ -193,24 +208,32 @@ int main() {
     constexpr size_t MAX_OUT_QUEUE_DEPTH = 256;
 
     bool needs_repaint = false;
-
     auto trigger_repaint = [&]() {
         needs_repaint = true;
         prepared_flip.reset();
     };
+
     uint64_t frames_rendered        = 0;
     uint64_t flips_completed        = 0;
     uint64_t presentations_sent     = 0;
     uint64_t commits_superseded     = 0;
 
+    auto get_session_by_id = [&](uint32_t s_id) -> ClientSession* {
+        for (auto& [fd, sess] : sessions) {
+            if (sess.session_id == s_id) return &sess;
+        }
+        return nullptr;
+    };
+
     auto queue_packet = [&](ClientSession& sess, yarilo::ipc::MessageType type, uint64_t seq,
-                            std::span<const std::byte> payload, uint64_t map_gid = 0, uint64_t map_uid = 0) {
-        if (sess.is_closing) return;
+                            std::span<const std::byte> payload, uint64_t map_gid = 0, uint64_t map_uid = 0) -> bool {
+        if (sess.is_closing) return true;
         
         if (sess.out_queue.size() >= MAX_OUT_QUEUE_DEPTH) {
-            std::println(stderr, "  -> [IPC] Disconnecting session {}: out_queue overflow (backpressure)", sess.session_id);
+            std::println(stderr, "  -> [IPC] Disconnecting session {}: out_queue overflow", sess.session_id);
             sess.is_closing = true;
-            return;
+            sess.out_queue.clear();
+            return false;
         }
         
         sess.out_queue.push_back(PendingOutPacket{
@@ -220,6 +243,7 @@ int main() {
             .map_req_global_id = map_gid,
             .map_req_server_uid = map_uid
         });
+        return true;
     };
 
     auto pump_wm_queue = [&](ClientSession& sess) {
@@ -250,56 +274,51 @@ int main() {
     };
 
     auto queue_buffer_released = [&](const core::ReleaseInfo& rel) {
-        for (auto& [fd, sess] : sessions) {
-            if (sess.session_id == rel.session_id && !sess.is_closing) {
-                std::byte buf[yarilo::ipc::BufferReleasedPayload::ENCODED_SIZE];
-                yarilo::ipc::BufferReleasedPayload p{
-                    .surface_id = rel.local_surface_id,
-                    .buffer_id = rel.buffer_id,
-                    .commit_seq = rel.commit_seq
-                };
-                if (p.encode(buf)) {
-                    queue_packet(sess, yarilo::ipc::MessageType::BufferReleased, rel.commit_seq, buf);
-                }
-                break;
+        if (auto* sess = get_session_by_id(rel.session_id)) {
+            std::byte buf[yarilo::ipc::BufferReleasedPayload::ENCODED_SIZE];
+            yarilo::ipc::BufferReleasedPayload p{
+                .surface_id = rel.local_surface_id,
+                .buffer_id = rel.buffer_id,
+                .commit_seq = rel.commit_seq
+            };
+            if (p.encode(buf)) {
+                (void)queue_packet(*sess, yarilo::ipc::MessageType::BufferReleased, rel.commit_seq, buf);
             }
         }
     };
 
     auto notify_wm_surface_destroyed = [&](uint64_t global_id) {
         if (!active_wm_session_id.has_value()) return;
-        
-        for (auto& [fd, sess] : sessions) {
-            if (sess.session_id == *active_wm_session_id && !sess.is_closing) {
-                std::byte buf[yarilo::ipc::WmSurfaceDestroyedPayload::ENCODED_SIZE];
-                yarilo::ipc::WmSurfaceDestroyedPayload p{ .global_surface_id = global_id };
-                if (p.encode(buf)) {
-                    queue_packet(sess, yarilo::ipc::MessageType::WmSurfaceDestroyed, 0, buf);
-                }
-                break;
+        if (auto* wsess = get_session_by_id(*active_wm_session_id)) {
+            std::byte buf[yarilo::ipc::WmSurfaceDestroyedPayload::ENCODED_SIZE];
+            yarilo::ipc::WmSurfaceDestroyedPayload p{ .global_surface_id = global_id };
+            if (p.encode(buf)) {
+                (void)queue_packet(*wsess, yarilo::ipc::MessageType::WmSurfaceDestroyed, 0, buf);
             }
         }
     };
 
     auto cancel_pending_wm_map_requests = [&](uint64_t gid, uint64_t suid) {
         if (!active_wm_session_id.has_value()) return;
-        
-        for (auto& [fd, sess] : sessions) {
-            if (sess.session_id == *active_wm_session_id) {
-                std::erase_if(sess.out_queue, [gid, suid](const PendingOutPacket& pkt) {
-                    return pkt.type == yarilo::ipc::MessageType::WmMapRequest &&
-                           pkt.map_req_global_id == gid &&
-                           pkt.map_req_server_uid == suid;
-                });
-                std::erase_if(sess.pending_wm_maps, [gid, suid](const core::MapRequestInfo& req) {
-                    return req.global_id == gid && req.server_uid == suid;
-                });
-                break;
-            }
+        if (auto* wsess = get_session_by_id(*active_wm_session_id)) {
+            std::erase_if(wsess->out_queue, [gid, suid](const PendingOutPacket& pkt) {
+                return pkt.type == yarilo::ipc::MessageType::WmMapRequest &&
+                       pkt.map_req_global_id == gid &&
+                       pkt.map_req_server_uid == suid;
+            });
+            std::erase_if(wsess->pending_wm_maps, [gid, suid](const core::MapRequestInfo& req) {
+                return req.global_id == gid && req.server_uid == suid;
+            });
         }
     };
 
+    // Единственный транспортный шлюз с гарантией Fail-Stop
     auto flush_out_queue = [&](ClientSession& sess) {
+        if (sess.is_closing) {
+            sess.out_queue.clear();
+            return;
+        }
+
         while (!sess.out_queue.empty()) {
             auto& pkt = sess.out_queue.front();
             auto res = yarilo::ipc::ServerSocket::send_packet(
@@ -307,10 +326,11 @@ int main() {
                 pkt.payload.data(), pkt.payload.size());
                 
             if (!res) {
-                if (res.error().value() == static_cast<int>(core::ServerError::WouldBlock)) {
+                if (res.error() == core::make_error(core::ServerError::WouldBlock)) {
                     break;
                 }
                 sess.is_closing = true;
+                sess.out_queue.clear();
                 break;
             }
             
@@ -318,41 +338,119 @@ int main() {
                 surface_manager.mark_map_request_sent(pkt.map_req_global_id, pkt.map_req_server_uid);
             }
             if (pkt.type == yarilo::ipc::MessageType::FramePresented) {
-                presentations_sent++; // Считаем только реально отправленные в сеть
+                presentations_sent++;
             }
             sess.out_queue.pop_front();
         }
     };
 
-    auto send_protocol_error = [&](int fd, uint64_t seq, uint32_t error_code) {
+    auto send_protocol_error = [&](ClientSession& sess, uint64_t seq, uint32_t error_code) {
         std::byte err_payload[yarilo::ipc::ProtocolErrorPayload::ENCODED_SIZE];
         yarilo::ipc::write_le32(err_payload, error_code);
-        (void)yarilo::ipc::ServerSocket::send_packet(
-            fd, yarilo::ipc::MessageType::ProtocolError, seq, err_payload, sizeof(err_payload));
+        (void)queue_packet(sess, yarilo::ipc::MessageType::ProtocolError, seq, err_payload);
+        flush_out_queue(sess);
+        sess.is_closing = true;
     };
 
     output->set_flip_callback([&](uint64_t, uint32_t, uint64_t, uint64_t vblank_ns) {
         flips_completed++;
         for (const auto& target : active_flip_targets) {
-            for (auto& [fd, sess] : sessions) {
-                if (sess.session_id == target.session_id && !sess.is_closing) {
-                    std::byte pres_payload[yarilo::ipc::FramePresentedPayload::ENCODED_SIZE];
-                    yarilo::ipc::FramePresentedPayload p{
-                        .surface_id = target.surface_id,
-                        .commit_seq = target.commit_seq,
-                        .presentation_time_ns = vblank_ns,
-                    };
-                    if (p.encode(pres_payload)) {
-                        queue_packet(sess, yarilo::ipc::MessageType::FramePresented, target.commit_seq, pres_payload);
-                    }
-                    // Обновляем счетчик ТОЛЬКО для живой сессии (P1 fix)
-                    surface_last_presented_seq[target.global_surface_id] = target.commit_seq;
-                    break;
+            if (auto* sess = get_session_by_id(target.session_id)) {
+                std::byte pres_payload[yarilo::ipc::FramePresentedPayload::ENCODED_SIZE];
+                yarilo::ipc::FramePresentedPayload p{
+                    .surface_id = target.surface_id,
+                    .commit_seq = target.commit_seq,
+                    .presentation_time_ns = vblank_ns,
+                };
+                if (p.encode(pres_payload)) {
+                    (void)queue_packet(*sess, yarilo::ipc::MessageType::FramePresented, target.commit_seq, pres_payload);
                 }
+                surface_last_presented_seq[target.global_surface_id] = target.commit_seq;
             }
         }
         active_flip_targets.clear();
     });
+
+    platform::input::InputEventCallbacks input_callbacks{
+        .hit_test = [&](double cx, double cy) -> std::optional<platform::input::HitTestResult> {
+            return surface_manager.hit_test(cx, cy);
+        },
+        
+        .get_surface_origin = [&](uint64_t gid) -> std::optional<std::pair<int32_t, int32_t>> {
+            return surface_manager.get_surface_origin(gid);
+        },
+
+        .send_pointer_motion = [&](uint32_t s_id, uint32_t surf_id, int32_t sx, int32_t sy, uint64_t time_us) -> bool {
+            auto* sess = get_session_by_id(s_id);
+            if (!sess) return false;
+            std::byte buf[yarilo::ipc::PointerMotionPayload::ENCODED_SIZE];
+            yarilo::ipc::PointerMotionPayload p{
+                .surface_id = surf_id, .surface_x = sx, .surface_y = sy, .pad = 0, .timestamp_us = time_us
+            };
+            if (!p.encode(buf)) return false;
+            return queue_packet(*sess, yarilo::ipc::MessageType::PointerMotion, 0, buf);
+        },
+
+        .send_pointer_button = [&](uint32_t s_id, uint32_t surf_id, uint32_t btn, uint32_t state, uint64_t time_us) -> bool {
+            auto* sess = get_session_by_id(s_id);
+            if (!sess) return false;
+            std::byte buf[yarilo::ipc::PointerButtonPayload::ENCODED_SIZE];
+            yarilo::ipc::PointerButtonPayload p{
+                .surface_id = surf_id, .button = btn, .state = state, .pad = 0, .timestamp_us = time_us
+            };
+            if (!p.encode(buf)) return false;
+            return queue_packet(*sess, yarilo::ipc::MessageType::PointerButton, 0, buf);
+        },
+
+        .send_keyboard_key = [&](uint32_t s_id, uint32_t surf_id, uint32_t key, uint32_t state, uint64_t time_us) -> bool {
+            auto* sess = get_session_by_id(s_id);
+            if (!sess) return false;
+            std::byte buf[yarilo::ipc::KeyboardKeyPayload::ENCODED_SIZE];
+            yarilo::ipc::KeyboardKeyPayload p{
+                .surface_id = surf_id, .key = key, .state = state, .pad = 0, .timestamp_us = time_us
+            };
+            if (!p.encode(buf)) return false;
+            return queue_packet(*sess, yarilo::ipc::MessageType::KeyboardKey, 0, buf);
+        },
+
+        .dispatch_synthetic_pointer_releases = [&](const platform::input::SyntheticPointerReleaseBatch& batch) -> bool {
+            auto* sess = get_session_by_id(batch.session_id);
+            if (!sess) return false;
+            for (size_t i = 0; i < batch.count; ++i) {
+                std::byte buf[yarilo::ipc::PointerButtonPayload::ENCODED_SIZE];
+                yarilo::ipc::PointerButtonPayload p{
+                    .surface_id = batch.surface_local_id, .button = batch.buttons[i], .state = 0, .pad = 0, .timestamp_us = batch.timestamp_us
+                };
+                if (!p.encode(buf) || !queue_packet(*sess, yarilo::ipc::MessageType::PointerButton, 0, buf)) {
+                    return false;
+                }
+            }
+            return true;
+        },
+
+        .dispatch_synthetic_key_releases = [&](const platform::input::SyntheticKeyReleaseBatch& batch) -> bool {
+            auto* sess = get_session_by_id(batch.session_id);
+            if (!sess) return false;
+            for (size_t i = 0; i < batch.count; ++i) {
+                std::byte buf[yarilo::ipc::KeyboardKeyPayload::ENCODED_SIZE];
+                yarilo::ipc::KeyboardKeyPayload p{
+                    .surface_id = batch.surface_local_id, .key = batch.keys[i], .state = 0, .pad = 0, .timestamp_us = batch.timestamp_us
+                };
+                if (!p.encode(buf) || !queue_packet(*sess, yarilo::ipc::MessageType::KeyboardKey, 0, buf)) {
+                    return false;
+                }
+            }
+            return true;
+        },
+
+        .kill_client_session = [&](uint32_t s_id) -> bool {
+            auto* sess = get_session_by_id(s_id);
+            if (!sess) return false;
+            sess->is_closing = true;
+            sess->out_queue.clear();
+            return true;
+        }
+    };
 
     drmEventContext drm_ev{};
     drm_ev.version = DRM_EVENT_CONTEXT_VERSION;
@@ -374,6 +472,7 @@ int main() {
         pfds.push_back(pollfd{ .fd = seat->poll_fd(), .events = POLLIN, .revents = 0 });
         pfds.push_back(pollfd{ .fd = seat_device.fd(), .events = POLLIN, .revents = 0 });
         pfds.push_back(pollfd{ .fd = server_socket->fd(), .events = POLLIN, .revents = 0 });
+        pfds.push_back(pollfd{ .fd = input_subsystem->poll_fd(), .events = POLLIN, .revents = 0 });
 
         for (auto& [fd, sess] : sessions) {
             if (sess.is_closing) continue;
@@ -388,23 +487,57 @@ int main() {
         if (ret < 0) {
             std::println(stderr, "Yarilo Fatal: poll() failed: {}", std::strerror(errno));
             exit_code = 1;
-            break;
+            goto server_teardown;
         }
 
+        // Обработка событий сеанса VT с гарантией suspend/resume
         if (pfds[0].revents & POLLIN) {
+            bool seat_was_active = seat->is_active();
             seat->dispatch(0);
+            bool seat_is_active = seat->is_active();
+
+            if (seat_was_active && !seat_is_active) {
+                auto susp_res = input_subsystem->suspend(input_callbacks);
+                if (!susp_res) {
+                    std::println(stderr, "Yarilo Fatal: Input suspend failed: {}", susp_res.error().message());
+                    exit_code = 1;
+                    goto server_teardown;
+                }
+            } else if (!seat_was_active && seat_is_active) {
+                auto res_res = input_subsystem->resume();
+                if (!res_res) {
+                    std::println(stderr, "Yarilo Fatal: Input resume failed: {}", res_res.error().message());
+                    exit_code = 1;
+                    goto server_teardown;
+                }
+            }
         }
 
         if (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             std::println(stderr, "Yarilo Fatal: DRM device revoked or hung in main loop.");
             exit_code = 1;
-            break;
+            goto server_teardown;
         }
         if (pfds[1].revents & POLLIN) {
             if (drmHandleEvent(seat_device.fd(), &drm_ev) != 0) {
                 std::println(stderr, "Yarilo Fatal: drmHandleEvent() failed in main loop: {}", std::strerror(errno));
                 exit_code = 1;
-                break;
+                goto server_teardown;
+            }
+        }
+
+        // Обработка ошибок дескриптора ввода
+        if (pfds[3].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            std::println(stderr, "Yarilo Fatal: Input subsystem poll error.");
+            exit_code = 1;
+            goto server_teardown;
+        }
+        if (pfds[3].revents & POLLIN) {
+            auto in_res = input_subsystem->process_events(input_callbacks);
+            if (!in_res) {
+                std::println(stderr, "Yarilo Fatal: Input processing error: {}. Aborting.", in_res.error().message());
+                exit_code = 1;
+                goto server_teardown;
             }
         }
 
@@ -427,7 +560,7 @@ int main() {
 
         for (size_t i = 0; i < active_session_fds.size(); ++i) {
             int cfd = active_session_fds[i];
-            const auto& pfd = pfds[3 + i];
+            const auto& pfd = pfds[4 + i];
             auto sess_it = sessions.find(cfd);
             if (sess_it == sessions.end() || sess_it->second.is_closing) continue;
 
@@ -446,7 +579,7 @@ int main() {
             if ((pfd.revents & POLLIN) && !sess.is_closing) {
                 auto packet_res = yarilo::ipc::ServerSocket::receive_packet(sess.socket_fd.get());
                 if (!packet_res) {
-                    if (packet_res.error().value() != static_cast<int>(core::ServerError::WouldBlock)) {
+                    if (packet_res.error() != core::make_error(core::ServerError::WouldBlock)) {
                         sess.is_closing = true;
                     }
                     continue;
@@ -457,8 +590,7 @@ int main() {
                 if (sess.role == ClientRole::Unauthenticated) {
                     if (packet.header.type == yarilo::ipc::MessageType::WmHandshake) {
                         if (active_wm_session_id.has_value()) {
-                            send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 10);
-                            sess.is_closing = true;
+                            send_protocol_error(sess, packet.header.sequence, 10);
                             continue;
                         }
                         sess.role = ClientRole::WindowManager;
@@ -472,7 +604,7 @@ int main() {
                         };
                         
                         if (ack_payload.encode(ack_buf)) {
-                            queue_packet(sess, yarilo::ipc::MessageType::WmHandshakeAck, packet.header.sequence, ack_buf);
+                            (void)queue_packet(sess, yarilo::ipc::MessageType::WmHandshakeAck, packet.header.sequence, ack_buf);
                         }
 
                         auto pending_maps = surface_manager.get_pending_map_requests();
@@ -491,8 +623,7 @@ int main() {
                     } else if (packet.header.type == yarilo::ipc::MessageType::CreateSurface) {
                         sess.role = ClientRole::Application;
                     } else {
-                        send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 11);
-                        sess.is_closing = true;
+                        send_protocol_error(sess, packet.header.sequence, 11);
                         continue;
                     }
                 }
@@ -504,10 +635,9 @@ int main() {
                         if (p && surface_manager.create_surface(sess.session_id, p->surface_id)) {
                             std::byte ack[4];
                             yarilo::ipc::write_le32(ack, p->surface_id);
-                            queue_packet(sess, yarilo::ipc::MessageType::SurfaceCreated, packet.header.sequence, ack);
+                            (void)queue_packet(sess, yarilo::ipc::MessageType::SurfaceCreated, packet.header.sequence, ack);
                         } else {
-                            send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 1);
-                            sess.is_closing = true;
+                            send_protocol_error(sess, packet.header.sequence, 1);
                         }
                     } else if (packet.header.type == yarilo::ipc::MessageType::AttachBuffer) {
                         auto p = yarilo::ipc::AttachBufferPayload::decode(
@@ -520,16 +650,13 @@ int main() {
                                 auto att_res = surface_manager.attach_buffer(
                                     sess.session_id, p->surface_id, p->buffer_id, std::move(shared_buf));
                                 if (!att_res) {
-                                    send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 3);
-                                    sess.is_closing = true;
+                                    send_protocol_error(sess, packet.header.sequence, 3);
                                 }
                             } else {
-                                send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 3);
-                                sess.is_closing = true;
+                                send_protocol_error(sess, packet.header.sequence, 3);
                             }
                         } else {
-                            send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 4);
-                            sess.is_closing = true;
+                            send_protocol_error(sess, packet.header.sequence, 4);
                         }
                     } else if (packet.header.type == yarilo::ipc::MessageType::CommitSurface) {
                         auto p = yarilo::ipc::CommitSurfacePayload::decode(
@@ -544,23 +671,18 @@ int main() {
                                 }
 
                                 if (com_res->map_request && active_wm_session_id.has_value()) {
-                                    for (auto& [wfd, wsess] : sessions) {
-                                        if (wsess.session_id == *active_wm_session_id && !wsess.is_closing) {
-                                            wsess.pending_wm_maps.push_back(*com_res->map_request);
-                                            pump_wm_queue(wsess);
-                                            flush_out_queue(wsess);
-                                            break;
-                                        }
+                                    if (auto* wsess = get_session_by_id(*active_wm_session_id)) {
+                                        wsess->pending_wm_maps.push_back(*com_res->map_request);
+                                        pump_wm_queue(*wsess);
+                                        flush_out_queue(*wsess);
                                     }
                                 }
                                 trigger_repaint();
                             } else {
-                                send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 5);
-                                sess.is_closing = true;
+                                send_protocol_error(sess, packet.header.sequence, 5);
                             }
                         } else {
-                            send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 5);
-                            sess.is_closing = true;
+                            send_protocol_error(sess, packet.header.sequence, 5);
                         }
                     } else if (packet.header.type == yarilo::ipc::MessageType::DestroySurface) {
                         auto p = yarilo::ipc::DestroySurfacePayload::decode(
@@ -568,6 +690,11 @@ int main() {
                         if (p) {
                             uint64_t gid = (static_cast<uint64_t>(sess.session_id) << 32) | p->surface_id;
                             
+                            // 1. Очистка клавиатурного фокуса и активного захвата мыши
+                            input_subsystem->clear_keyboard_focus_for_surface(gid, input_callbacks);
+                            input_subsystem->cancel_grab_for_surface(gid, input_callbacks);
+
+                            // 2. Уничтожение поверхности
                             auto dest_res = surface_manager.destroy_surface(sess.session_id, p->surface_id);
                             if (dest_res) {
                                 cancel_pending_wm_map_requests(gid, dest_res->server_uid);
@@ -581,13 +708,11 @@ int main() {
                                 }
                                 trigger_repaint();
                             } else {
-                                send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 6);
-                                sess.is_closing = true;
+                                send_protocol_error(sess, packet.header.sequence, 6);
                             }
                         }
                     } else {
-                        send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 8);
-                        sess.is_closing = true;
+                        send_protocol_error(sess, packet.header.sequence, 8);
                     }
                 } else if (sess.role == ClientRole::WindowManager) {
                     if (packet.header.type == yarilo::ipc::MessageType::WmConfigureSurface) {
@@ -599,11 +724,34 @@ int main() {
                             if (conf_res) {
                                 trigger_repaint();
                             } else {
-                                send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 12);
+                                send_protocol_error(sess, packet.header.sequence, 12);
+                            }
+                        }
+                    } else if (packet.header.type == yarilo::ipc::MessageType::WmSetKeyboardFocus) {
+                        auto p = yarilo::ipc::WmSetKeyboardFocusPayload::decode(
+                            std::span<const std::byte>(packet.payload.data(), packet.payload_len));
+                        if (p) {
+                            uint64_t gid = p->global_surface_id;
+                            if (gid == 0) {
+                                auto k_res = input_subsystem->set_keyboard_focus(0, 0, 0, input_callbacks);
+                                if (!k_res) {
+                                    std::println(stderr, "Yarilo Fatal: Failed to clear keyboard focus");
+                                    exit_code = 1;
+                                    goto server_teardown;
+                                }
+                            } else if (surface_manager.surface_is_mapped(gid)) {
+                                uint32_t target_sess = static_cast<uint32_t>(gid >> 32);
+                                uint32_t target_local = static_cast<uint32_t>(gid & 0xFFFFFFFFULL);
+                                auto k_res = input_subsystem->set_keyboard_focus(gid, target_local, target_sess, input_callbacks);
+                                if (!k_res) {
+                                    std::println(stderr, "Yarilo Fatal: Failed to set keyboard focus");
+                                    exit_code = 1;
+                                    goto server_teardown;
+                                }
                             }
                         }
                     } else {
-                        send_protocol_error(sess.socket_fd.get(), packet.header.sequence, 8);
+                        send_protocol_error(sess, packet.header.sequence, 8);
                     }
                 }
             }
@@ -675,19 +823,19 @@ int main() {
                 active_flip_targets = std::move(prepared_flip->targets);
                 prepared_flip.reset();
                 flip_retry_count = 0;
-            } else if (flip_res.error().value() == static_cast<int>(core::ServerError::WouldBlock)) {
+            } else if (flip_res.error() == core::make_error(core::ServerError::WouldBlock)) {
                 flip_retry_count++;
                 if (flip_retry_count >= MAX_FLIP_RETRIES) {
                     std::println(stderr, "KMS Fatal: EBUSY retry limit ({}) exceeded", MAX_FLIP_RETRIES);
                     prepared_flip.reset();
                     exit_code = 1;
-                    break;
+                    goto server_teardown;
                 }
             } else {
                 std::println(stderr, "KMS Fatal: Page flip schedule error ({})", flip_res.error().message());
                 prepared_flip.reset();
                 exit_code = 1;
-                break;
+                goto server_teardown;
             }
         }
 
@@ -695,6 +843,9 @@ int main() {
             if (it->second.is_closing) {
                 uint32_t s_id = it->second.session_id;
                 
+                // Безопасный сброс захватов ДО удаления сессии и поверхностей
+                input_subsystem->cancel_grab_for_closing_session(s_id);
+
                 if (it->second.role == ClientRole::WindowManager) {
                     std::println("  -> [IPC] Window Manager disconnected (Session {})", s_id);
                     active_wm_session_id.reset();
@@ -704,17 +855,14 @@ int main() {
                     std::println("  -> [IPC] Application disconnected (Session {})", s_id);
                     
                     if (active_wm_session_id.has_value()) {
-                        for (auto& [wfd, wsess] : sessions) {
-                            if (wsess.session_id == *active_wm_session_id) {
-                                std::erase_if(wsess.out_queue, [s_id](const PendingOutPacket& pkt) {
-                                    return pkt.type == yarilo::ipc::MessageType::WmMapRequest &&
-                                           static_cast<uint32_t>(pkt.map_req_global_id >> 32) == s_id;
-                                });
-                                std::erase_if(wsess.pending_wm_maps, [s_id](const core::MapRequestInfo& req) {
-                                    return static_cast<uint32_t>(req.global_id >> 32) == s_id;
-                                });
-                                break;
-                            }
+                        if (auto* wsess = get_session_by_id(*active_wm_session_id)) {
+                            std::erase_if(wsess->out_queue, [s_id](const PendingOutPacket& pkt) {
+                                return pkt.type == yarilo::ipc::MessageType::WmMapRequest &&
+                                       static_cast<uint32_t>(pkt.map_req_global_id >> 32) == s_id;
+                            });
+                            std::erase_if(wsess->pending_wm_maps, [s_id](const core::MapRequestInfo& req) {
+                                return static_cast<uint32_t>(req.global_id >> 32) == s_id;
+                            });
                         }
                     }
 
@@ -734,7 +882,8 @@ int main() {
                         trigger_repaint();
                     } else {
                         std::println(stderr, "Yarilo Fatal: Failed to cleanup client surfaces. OOM? Aborting.");
-                        g_running = 0; // Инициируем безопасное завершение сервера
+                        exit_code = 1;
+                        goto server_teardown;
                     }
                 }
                 
@@ -745,8 +894,9 @@ int main() {
         }
     }
 
+server_teardown:
     std::println("\n=================================================");
-    std::println("  Yarilo v0.5 Hardware Metrics:                  ");
+    std::println("  Yarilo v0.6 Hardware Metrics:                  ");
     std::println("    Frames Rendered (CPU Blit): {}", frames_rendered);
     std::println("    Flips Completed (vblank):   {}", flips_completed);
     std::println("    Presentations Sent (IPC):   {}", presentations_sent);
@@ -754,13 +904,18 @@ int main() {
     std::println("=================================================");
 
     bool safe_to_restore = true;
+    bool drain_failed = false;
+
     if (output->is_page_flip_pending()) {
         std::println("Yarilo Shutdown: Draining in-flight page flip before CRTC restore...");
         auto drain_start = std::chrono::steady_clock::now();
         
         while (output->is_page_flip_pending()) {
             auto elapsed = std::chrono::steady_clock::now() - drain_start;
-            if (elapsed >= std::chrono::milliseconds(500)) break;
+            if (elapsed >= std::chrono::milliseconds(500)) {
+                drain_failed = true;
+                break;
+            }
             
             int timeout_ms = 500 - static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
             pollfd pfd{ .fd = seat_device.fd(), .events = POLLIN, .revents = 0 };
@@ -769,24 +924,26 @@ int main() {
             if (p_ret < 0 && errno == EINTR) continue;
             if (p_ret < 0) {
                 std::println(stderr, "Yarilo Error: poll() failed during drain: {}", std::strerror(errno));
+                drain_failed = true;
                 break;
             }
             if (p_ret > 0) {
                 if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
                     std::println(stderr, "Yarilo Error: DRM device revoked or hung during drain.");
+                    drain_failed = true;
                     break;
                 }
                 if (pfd.revents & POLLIN) {
                     if (drmHandleEvent(seat_device.fd(), &drm_ev) != 0) {
                         std::println(stderr, "Yarilo Fatal: drmHandleEvent() failed in drain loop: {}", std::strerror(errno));
-                        exit_code = 1;
+                        drain_failed = true;
                         break;
                     }
                 }
             }
         }
 
-        if (output->is_page_flip_pending()) {
+        if (drain_failed || output->is_page_flip_pending()) {
             std::println(stderr, "Yarilo Fatal: Page flip drain aborted or timed out. Skipping unsafe KMS restore.");
             safe_to_restore = false;
             exit_code = 1;
@@ -801,8 +958,9 @@ int main() {
             exit_code = 1;
         }
     } else {
-        std::println(stderr, "Yarilo Emergency Teardown: Scanout hardware unresolved. "
-                             "Kernel will reclaim DRM resources on process termination.");
+        std::println(stderr, "Yarilo Emergency Teardown: Scanout hardware unresolved.\n"
+                             "Skipping CRTC restore to prevent GPU hang. Display may remain frozen.\n"
+                             "Process termination will release file descriptors and trigger kernel resource reclaim.");
     }
 
     return exit_code;

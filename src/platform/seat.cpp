@@ -93,11 +93,29 @@ core::Result<void> Seat::wait_for_activation(int timeout_ms) {
 }
 
 core::Result<core::SeatDevice> Seat::open_device(const char* path) {
-    int device_id = -1;
-    int fd = libseat_open_device(seat_, path, &device_id);
-    if (fd < 0 || device_id < 0) {
+    if (!seat_ || !path) {
         return std::unexpected(core::make_error(core::ServerError::PermissionDenied));
     }
+
+    errno = 0;
+    int fd = -1;
+    int device_id = libseat_open_device(seat_, path, &fd);
+    int err = (errno != 0) ? errno : EACCES;
+
+    // Транзакционный откат при частичном открытии
+    if (device_id < 0 || fd < 0) {
+        if (device_id >= 0) {
+            libseat_close_device(seat_, device_id);
+        }
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        try {
+            std::println(stderr, "Yarilo Error: libseat_open_device failed for {}: {}", path, std::strerror(err));
+        } catch (...) {}
+        return std::unexpected(core::make_error(core::ServerError::PermissionDenied));
+    }
+
     return core::SeatDevice(seat_, device_id, fd);
 }
 
