@@ -1,4 +1,5 @@
 #pragma once
+#include "platform/input/types.hpp"
 #include "platform/input/time.hpp"
 #include <cstdint>
 #include <array>
@@ -10,6 +11,8 @@ namespace platform::input {
 
 constexpr size_t MAX_SEAT_POINTERS = 16;
 constexpr size_t MAX_UNIQUE_BUTTONS = 16;
+
+using SyntheticReleaseBatch = SyntheticPointerReleaseBatch;
 
 enum class ButtonPressAction {
     NewGrabAndLogicalPress,     // Первая кнопка: активирует захват, отправить клиенту (state = 1)
@@ -59,26 +62,6 @@ struct GrabbedButtonSlot {
 
     [[nodiscard]] bool is_held() const noexcept {
         return device_mask != 0;
-    }
-};
-
-// Пакет дедуплицированных синтетических отпусканий с монотонным временем CLOCK_MONOTONIC
-struct SyntheticReleaseBatch {
-    uint32_t session_id{0};
-    uint32_t surface_local_id{0};
-    uint64_t timestamp_us{0};
-    std::array<uint32_t, MAX_UNIQUE_BUTTONS> buttons{};
-    size_t count{0};
-
-    [[nodiscard]] bool has_events() const noexcept { return count > 0; }
-
-    void add_unique(uint32_t button) noexcept {
-        for (size_t i = 0; i < count; ++i) {
-            if (buttons[i] == button) return;
-        }
-        if (count < buttons.size()) {
-            buttons[count++] = button;
-        }
     }
 };
 

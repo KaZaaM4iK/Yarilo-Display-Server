@@ -239,7 +239,8 @@ CMakeFiles/yarilo.dir/src/platform/seat.cpp.o: \
  /usr/include/c++/15/bits/mofunc_impl.h \
  /tank/data/project/Yarilo/include/core/error.hpp /usr/include/poll.h \
  /usr/include/x86_64-linux-gnu/sys/poll.h \
- /usr/include/x86_64-linux-gnu/bits/poll.h /usr/include/c++/15/chrono \
+ /usr/include/x86_64-linux-gnu/bits/poll.h /usr/include/c++/15/cstring \
+ /usr/include/string.h /usr/include/strings.h /usr/include/c++/15/chrono \
  /usr/include/c++/15/bits/chrono.h /usr/include/c++/15/ratio \
  /usr/include/c++/15/limits /usr/include/c++/15/ctime \
  /usr/include/c++/15/bits/parse_numbers.h /usr/include/c++/15/sstream \

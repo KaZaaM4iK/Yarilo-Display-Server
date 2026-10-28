@@ -237,9 +237,31 @@ CMakeFiles/yarilo.dir/src/main.cpp.o: \
  /usr/include/c++/15/bits/move_only_function.h \
  /usr/include/c++/15/bits/mofunc_impl.h \
  /tank/data/project/Yarilo/include/platform/drm/output.hpp \
+ /tank/data/project/Yarilo/include/platform/input/input_subsystem.hpp \
+ /tank/data/project/Yarilo/include/platform/input/types.hpp \
+ /tank/data/project/Yarilo/include/platform/input/seat_adapter.hpp \
+ /usr/include/libinput.h /usr/include/libudev.h \
+ /usr/include/x86_64-linux-gnu/sys/sysmacros.h \
+ /usr/include/x86_64-linux-gnu/bits/sysmacros.h \
+ /usr/include/c++/15/stdlib.h /usr/include/c++/15/print \
+ /usr/include/c++/15/format /usr/include/c++/15/limits \
+ /usr/include/c++/15/locale \
+ /usr/include/c++/15/bits/locale_facets_nonio.h /usr/include/c++/15/ctime \
+ /usr/include/x86_64-linux-gnu/c++/15/bits/time_members.h \
+ /usr/include/x86_64-linux-gnu/c++/15/bits/messages_members.h \
+ /usr/include/libintl.h /usr/include/c++/15/bits/codecvt.h \
+ /usr/include/c++/15/bits/locale_facets_nonio.tcc \
+ /usr/include/c++/15/bits/locale_conv.h /usr/include/c++/15/optional \
+ /usr/include/c++/15/span \
+ /tank/data/project/Yarilo/include/platform/input/pointer_registry.hpp \
+ /tank/data/project/Yarilo/include/platform/input/pointer_grab.hpp \
+ /tank/data/project/Yarilo/include/platform/input/time.hpp \
+ /tank/data/project/Yarilo/include/core/error.hpp \
+ /usr/include/c++/15/algorithm /usr/include/c++/15/bits/ranges_algo.h \
+ /usr/include/c++/15/pstl/glue_algorithm_defs.h \
+ /tank/data/project/Yarilo/include/platform/input/keyboard_focus.hpp \
  /tank/data/project/Yarilo/include/ipc/server_socket.hpp \
  /tank/data/project/Yarilo/include/ipc/protocol.hpp \
- /usr/include/c++/15/optional /usr/include/c++/15/span \
  /tank/data/project/Yarilo/include/core/surface.hpp \
  /tank/data/project/Yarilo/include/shm/validator.hpp \
  /usr/include/x86_64-linux-gnu/sys/mman.h \
@@ -260,18 +282,9 @@ CMakeFiles/yarilo.dir/src/main.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h \
  /usr/include/linux/falloc.h /usr/include/linux/openat2.h \
  /usr/include/x86_64-linux-gnu/bits/openat2.h \
- /usr/include/libdrm/drm_fourcc.h /usr/include/c++/15/limits \
+ /usr/include/libdrm/drm_fourcc.h \
  /tank/data/project/Yarilo/include/core/geometry.hpp \
- /usr/include/c++/15/algorithm /usr/include/c++/15/bits/ranges_algo.h \
- /usr/include/c++/15/pstl/glue_algorithm_defs.h /usr/include/c++/15/print \
- /usr/include/c++/15/format /usr/include/c++/15/locale \
- /usr/include/c++/15/bits/locale_facets_nonio.h /usr/include/c++/15/ctime \
- /usr/include/x86_64-linux-gnu/c++/15/bits/time_members.h \
- /usr/include/x86_64-linux-gnu/c++/15/bits/messages_members.h \
- /usr/include/libintl.h /usr/include/c++/15/bits/codecvt.h \
- /usr/include/c++/15/bits/locale_facets_nonio.tcc \
- /usr/include/c++/15/bits/locale_conv.h /usr/include/c++/15/csignal \
- /usr/include/signal.h \
+ /usr/include/c++/15/csignal /usr/include/signal.h \
  /usr/include/x86_64-linux-gnu/bits/signum-generic.h \
  /usr/include/x86_64-linux-gnu/bits/signum-arch.h \
  /usr/include/x86_64-linux-gnu/bits/types/sig_atomic_t.h \

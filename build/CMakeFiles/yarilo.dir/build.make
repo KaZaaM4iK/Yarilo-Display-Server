@@ -178,6 +178,8 @@ yarilo: CMakeFiles/yarilo.dir/build.make
 yarilo: CMakeFiles/yarilo.dir/compiler_depend.ts
 yarilo: /usr/lib/x86_64-linux-gnu/libdrm.so
 yarilo: /usr/lib/x86_64-linux-gnu/libseat.so
+yarilo: /usr/lib/x86_64-linux-gnu/libinput.so
+yarilo: /usr/lib/x86_64-linux-gnu/libudev.so
 yarilo: CMakeFiles/yarilo.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/tank/data/project/Yarilo/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Linking CXX executable yarilo"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/yarilo.dir/link.txt --verbose=$(VERBOSE)

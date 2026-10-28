@@ -1,8 +1,11 @@
+
 #pragma once
-#include <cstdint>
+
+#include "platform/input/types.hpp"
+
 #include <array>
 #include <cstddef>
-#include <print>
+#include <cstdio>
 
 extern "C" {
 #include <libinput.h>
@@ -10,79 +13,111 @@ extern "C" {
 
 namespace platform::input {
 
-class SeatPointerRegistry {
+class SeatDeviceRegistry {
 public:
-    static constexpr size_t MAX_POINTERS = 16;
+    static constexpr size_t MAX_DEVICES = MAX_SEAT_DEVICES;
 
-    SeatPointerRegistry() noexcept = default;
-    
-    ~SeatPointerRegistry() noexcept {
+    SeatDeviceRegistry() noexcept = default;
+
+    ~SeatDeviceRegistry() noexcept {
         reset();
     }
 
-    SeatPointerRegistry(const SeatPointerRegistry&) = delete;
-    SeatPointerRegistry& operator=(const SeatPointerRegistry&) = delete;
+    SeatDeviceRegistry(const SeatDeviceRegistry&) = delete;
+    SeatDeviceRegistry& operator=(const SeatDeviceRegistry&) = delete;
 
-    // Регистрация устройства при LIBINPUT_EVENT_DEVICE_ADDED.
-    // Возвращает индекс [0..15] при успехе.
-    // Возвращает -1, если пул мест исчерпан (отказ в допуске).
+    // Допуск устройства в общий seat.
+    // Возвращает индекс [0..MAX_DEVICES-1] либо -1.
     int admit_device(struct libinput_device* dev) noexcept {
-        if (!dev) return -1;
+        if (!dev) {
+            return -1;
+        }
 
-        // Проверяем, не зарегистрировано ли уже
-        for (size_t i = 0; i < MAX_POINTERS; ++i) {
+        for (size_t i = 0; i < MAX_DEVICES; ++i) {
             if (devices_[i] == dev) {
                 return static_cast<int>(i);
             }
         }
 
-        // Ищем свободный слот
-        for (size_t i = 0; i < MAX_POINTERS; ++i) {
+        for (size_t i = 0; i < MAX_DEVICES; ++i) {
             if (devices_[i] == nullptr) {
-                devices_[i] = dev;
-                libinput_device_ref(dev);
+                devices_[i] = libinput_device_ref(dev);
                 return static_cast<int>(i);
             }
         }
 
-        try {
-            std::println(stderr, "Yarilo Warning: Seat pointer limit (16) reached. Device rejected.");
-        } catch (...) {}
-        return -1; // Шлюз закрыт: отказ в допуске
-    }
+        std::fprintf(
+            stderr,
+            "Yarilo Warning: Seat device limit (%zu) reached. "
+            "Device rejected.\n",
+            MAX_DEVICES
+        );
 
-    // Поиск индекса допущенного устройства при событиях ввода.
-    // Возвращает -1, если устройство не допущено к сеансу.
-    [[nodiscard]] int get_device_index(struct libinput_device* dev) const noexcept {
-        if (!dev) return -1;
-        for (size_t i = 0; i < MAX_POINTERS; ++i) {
-            if (devices_[i] == dev) {
-                return static_cast<int>(i);
-            }
-        }
         return -1;
     }
 
-    // Освобождение слота устройства.
-    // Вызывается СТРОГО ПОСЛЕ зачистки битовой маски в PointerGrabState!
-    void release_device(size_t index) noexcept {
-        if (index < MAX_POINTERS && devices_[index] != nullptr) {
-            libinput_device_unref(devices_[index]);
-            devices_[index] = nullptr;
+    // Индекс только ранее допущенного устройства.
+    [[nodiscard]] int get_device_index(
+        struct libinput_device* dev
+    ) const noexcept {
+        if (!dev) {
+            return -1;
         }
+
+        for (size_t i = 0; i < MAX_DEVICES; ++i) {
+            if (devices_[i] == dev) {
+                return static_cast<int>(i);
+            }
+        }
+
+        return -1;
+    }
+
+    // Освобождать только после очистки состояния устройства
+    // в PointerGrabState и KeyboardFocusState.
+    void release_device(size_t index) noexcept {
+        if (index >= MAX_DEVICES || devices_[index] == nullptr) {
+            return;
+        }
+
+        libinput_device_unref(devices_[index]);
+        devices_[index] = nullptr;
     }
 
     void reset() noexcept {
-        for (size_t i = 0; i < MAX_POINTERS; ++i) {
-            if (devices_[i] != nullptr) {
-                libinput_device_unref(devices_[i]);
-                devices_[i] = nullptr;
-            }
+        for (size_t i = 0; i < MAX_DEVICES; ++i) {
+            release_device(i);
         }
     }
 
 private:
-    std::array<struct libinput_device*, MAX_POINTERS> devices_{};
+    std::array<struct libinput_device*, MAX_DEVICES> devices_{};
+};
+
+// Освобождает слот при любом выходе из области обработки
+// LIBINPUT_EVENT_DEVICE_REMOVED, включая выход через исключение.
+class DeviceIndexReleaser {
+public:
+    DeviceIndexReleaser(
+        SeatDeviceRegistry& registry,
+        int index
+    ) noexcept
+        : registry_(&registry), index_(index) {}
+
+    ~DeviceIndexReleaser() noexcept {
+        if (registry_ && index_ >= 0) {
+            registry_->release_device(
+                static_cast<size_t>(index_)
+            );
+        }
+    }
+
+    DeviceIndexReleaser(const DeviceIndexReleaser&) = delete;
+    DeviceIndexReleaser& operator=(const DeviceIndexReleaser&) = delete;
+
+private:
+    SeatDeviceRegistry* registry_;
+    int index_;
 };
 
 } // namespace platform::input

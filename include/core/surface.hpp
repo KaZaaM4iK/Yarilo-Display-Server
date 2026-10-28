@@ -1,6 +1,7 @@
 #pragma once
 #include "shm/validator.hpp"
 #include "core/types.hpp"
+#include "platform/input/types.hpp"
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -176,6 +177,20 @@ public:
     core::Result<SnapshotResult> take_render_snapshot();
 
     std::optional<ReleaseInfo> release_read_lease(uint64_t lease_id) noexcept;
+
+    [[nodiscard]]
+    std::optional<platform::input::HitTestResult>
+    hit_test(double cursor_x, double cursor_y) const noexcept;
+
+    [[nodiscard]]
+    std::optional<std::pair<int32_t, int32_t>>
+    get_surface_origin(uint64_t gid) const noexcept;
+
+    [[nodiscard]]
+    bool surface_exists(uint64_t gid) const noexcept;
+
+    [[nodiscard]]
+    bool surface_is_mapped(uint64_t gid) const noexcept;
 
 private:
     core::Result<void> validate_surface_graph_invariants(const Surface& s) const;

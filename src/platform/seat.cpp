@@ -2,6 +2,7 @@
 #include "core/error.hpp"
 #include <poll.h>
 #include <cerrno>
+#include <cstring>
 #include <chrono>
 #include <print>
 

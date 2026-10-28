@@ -285,6 +285,7 @@ CMakeFiles/yarilo.dir/src/core/surface.cpp.o
  /tank/data/project/Yarilo/include/core/error.hpp
  /tank/data/project/Yarilo/include/core/surface.hpp
  /tank/data/project/Yarilo/include/core/types.hpp
+ /tank/data/project/Yarilo/include/platform/input/types.hpp
  /tank/data/project/Yarilo/include/shm/validator.hpp
  /usr/include/alloca.h
  /usr/include/asm-generic/bitsperlong.h
@@ -923,12 +924,20 @@ CMakeFiles/yarilo.dir/src/ipc/server_socket.cpp.o
 
 CMakeFiles/yarilo.dir/src/main.cpp.o
  /tank/data/project/Yarilo/src/main.cpp
+ /tank/data/project/Yarilo/include/core/error.hpp
  /tank/data/project/Yarilo/include/core/geometry.hpp
  /tank/data/project/Yarilo/include/core/surface.hpp
  /tank/data/project/Yarilo/include/core/types.hpp
  /tank/data/project/Yarilo/include/ipc/protocol.hpp
  /tank/data/project/Yarilo/include/ipc/server_socket.hpp
  /tank/data/project/Yarilo/include/platform/drm/output.hpp
+ /tank/data/project/Yarilo/include/platform/input/input_subsystem.hpp
+ /tank/data/project/Yarilo/include/platform/input/keyboard_focus.hpp
+ /tank/data/project/Yarilo/include/platform/input/pointer_grab.hpp
+ /tank/data/project/Yarilo/include/platform/input/pointer_registry.hpp
+ /tank/data/project/Yarilo/include/platform/input/seat_adapter.hpp
+ /tank/data/project/Yarilo/include/platform/input/time.hpp
+ /tank/data/project/Yarilo/include/platform/input/types.hpp
  /tank/data/project/Yarilo/include/platform/seat.hpp
  /tank/data/project/Yarilo/include/shm/validator.hpp
  /usr/include/alloca.h
@@ -1107,6 +1116,7 @@ CMakeFiles/yarilo.dir/src/main.cpp.o
  /usr/include/c++/15/span
  /usr/include/c++/15/sstream
  /usr/include/c++/15/stdexcept
+ /usr/include/c++/15/stdlib.h
  /usr/include/c++/15/streambuf
  /usr/include/c++/15/string
  /usr/include/c++/15/string_view
@@ -1127,8 +1137,10 @@ CMakeFiles/yarilo.dir/src/main.cpp.o
  /usr/include/libdrm/drm.h
  /usr/include/libdrm/drm_fourcc.h
  /usr/include/libdrm/drm_mode.h
+ /usr/include/libinput.h
  /usr/include/libintl.h
  /usr/include/libseat.h
+ /usr/include/libudev.h
  /usr/include/limits.h
  /usr/include/linux/close_range.h
  /usr/include/linux/errno.h
@@ -1223,6 +1235,7 @@ CMakeFiles/yarilo.dir/src/main.cpp.o
  /usr/include/x86_64-linux-gnu/bits/struct_rwlock.h
  /usr/include/x86_64-linux-gnu/bits/struct_stat.h
  /usr/include/x86_64-linux-gnu/bits/syscall.h
+ /usr/include/x86_64-linux-gnu/bits/sysmacros.h
  /usr/include/x86_64-linux-gnu/bits/thread-shared-types.h
  /usr/include/x86_64-linux-gnu/bits/time.h
  /usr/include/x86_64-linux-gnu/bits/time64.h
@@ -1295,6 +1308,7 @@ CMakeFiles/yarilo.dir/src/main.cpp.o
  /usr/include/x86_64-linux-gnu/sys/single_threaded.h
  /usr/include/x86_64-linux-gnu/sys/stat.h
  /usr/include/x86_64-linux-gnu/sys/syscall.h
+ /usr/include/x86_64-linux-gnu/sys/sysmacros.h
  /usr/include/x86_64-linux-gnu/sys/types.h
  /usr/include/x86_64-linux-gnu/sys/ucontext.h
  /usr/include/xf86drm.h
@@ -1763,6 +1777,7 @@ CMakeFiles/yarilo.dir/src/platform/seat.cpp.o
  /usr/include/c++/15/cstdint
  /usr/include/c++/15/cstdio
  /usr/include/c++/15/cstdlib
+ /usr/include/c++/15/cstring
  /usr/include/c++/15/ctime
  /usr/include/c++/15/cwchar
  /usr/include/c++/15/cwctype
@@ -1835,6 +1850,8 @@ CMakeFiles/yarilo.dir/src/platform/seat.cpp.o
  /usr/include/stdint.h
  /usr/include/stdio.h
  /usr/include/stdlib.h
+ /usr/include/string.h
+ /usr/include/strings.h
  /usr/include/syscall.h
  /usr/include/time.h
  /usr/include/unistd.h
@@ -1965,14 +1982,30 @@ yarilo
  /usr/lib/gcc/x86_64-linux-gnu/15/libgcc.a
  /usr/lib/gcc/x86_64-linux-gnu/15/libgcc_s.so
  /usr/lib/gcc/x86_64-linux-gnu/15/libstdc++.so
+ /usr/lib/i386-linux-gnu/libatomic.so.1
+ /usr/lib/i386-linux-gnu/libffi.so.8
+ /usr/lib/i386-linux-gnu/libglib-2.0.so.0
+ /usr/lib/i386-linux-gnu/libgobject-2.0.so.0
+ /usr/lib/i386-linux-gnu/libpcre2-8.so.0
  /usr/lib/i386-linux-gnu/libsystemd.so.0
+ /usr/lib/x86_64-linux-gnu/libatomic.so.1
  /usr/lib/x86_64-linux-gnu/libc.so.6
  /usr/lib/x86_64-linux-gnu/libc_nonshared.a
  /usr/lib/x86_64-linux-gnu/libdrm.so
+ /usr/lib/x86_64-linux-gnu/libevdev.so.2
+ /usr/lib/x86_64-linux-gnu/libffi.so.8
+ /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+ /usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0
+ /usr/lib/x86_64-linux-gnu/libgudev-1.0.so.0
+ /usr/lib/x86_64-linux-gnu/libinput.so
  /usr/lib/x86_64-linux-gnu/libm.so.6
+ /usr/lib/x86_64-linux-gnu/libmtdev.so.1
  /usr/lib/x86_64-linux-gnu/libmvec.so.1
+ /usr/lib/x86_64-linux-gnu/libpcre2-8.so.0
  /usr/lib/x86_64-linux-gnu/libseat.so
  /usr/lib/x86_64-linux-gnu/libsystemd.so.0
+ /usr/lib/x86_64-linux-gnu/libudev.so
+ /usr/lib/x86_64-linux-gnu/libwacom.so.9
  /tank/data/project/Yarilo/build/CMakeFiles/yarilo.dir/src/core/error.cpp.o
  /tank/data/project/Yarilo/build/CMakeFiles/yarilo.dir/src/core/surface.cpp.o
  /tank/data/project/Yarilo/build/CMakeFiles/yarilo.dir/src/ipc/server_socket.cpp.o

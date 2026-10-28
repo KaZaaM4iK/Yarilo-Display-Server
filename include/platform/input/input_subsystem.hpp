@@ -17,9 +17,14 @@
 #include <cstdlib>
 #include <print>
 
-#if defined(__linux__)
-#include <libudev.h>
+#if !defined(__linux__)
+#error "Yarilo Sprint 6.1 InputSubsystem currently requires Linux with libudev. FreeBSD backend is scheduled for Sprint 7."
 #endif
+
+extern "C" {
+#include <libinput.h>
+#include <libudev.h>
+}
 
 namespace platform::input {
 
@@ -37,12 +42,10 @@ struct InputEventCallbacks {
     std::function<bool(uint32_t session_id)> kill_client_session;
 };
 
-#if defined(__linux__)
 struct UdevDeleter {
     void operator()(struct udev* u) const noexcept { if (u) udev_unref(u); }
 };
 using UniqueUdev = std::unique_ptr<struct udev, UdevDeleter>;
-#endif
 
 struct LibinputEventDeleter {
     void operator()(struct libinput_event* ev) const noexcept { if (ev) libinput_event_destroy(ev); }
@@ -55,7 +58,6 @@ public:
         if (screen_w == 0 || screen_h == 0) return std::unexpected(core::make_error(core::ServerError::InternalStateError));
         if (auto clk_res = MonotonicClock::initialize_epoch(); !clk_res) return std::unexpected(clk_res.error());
 
-#if defined(__linux__)
         UniqueUdev u(udev_new());
         if (!u) return std::unexpected(core::make_error(core::ServerError::InternalStateError));
 
@@ -75,16 +77,6 @@ public:
         if (libinput_udev_assign_seat(sub->li_, seat_name) != 0) {
             return std::unexpected(core::make_error(core::ServerError::PermissionDenied));
         }
-#else
-        // FreeBSD: создание path-контекста или через devd
-        std::unique_ptr<InputSubsystem> sub;
-        try { sub.reset(new InputSubsystem(seat.handle(), screen_w, screen_h)); } 
-        catch (...) { return std::unexpected(core::make_error(core::ServerError::OutOfMemory)); }
-
-        struct libinput* li = libinput_path_create_context(&SeatInputAdapter::interface(), &sub->adapter_);
-        if (!li) return std::unexpected(core::make_error(core::ServerError::InternalStateError));
-        sub->li_ = li;
-#endif
 
         return sub;
     }
@@ -94,9 +86,7 @@ public:
         keyboard_state_.reset();
         device_registry_.reset();
         if (li_) { libinput_unref(li_); li_ = nullptr; }
-#if defined(__linux__)
         if (udev_) { udev_unref(udev_); udev_ = nullptr; }
-#endif
     }
 
     InputSubsystem(const InputSubsystem&) = delete;
@@ -164,13 +154,13 @@ public:
         return {};
     }
 
-    void clear_keyboard_focus_for_surface(uint64_t gid, const InputEventCallbacks& cb) noexcept {
+    core::Result<void> clear_keyboard_focus_for_surface(uint64_t gid, const InputEventCallbacks& cb) noexcept {
         if (keyboard_state_.surface_gid() == gid) {
-            (void)set_keyboard_focus(0, 0, 0, cb);
+            return set_keyboard_focus(0, 0, 0, cb);
         }
+        return {};
     }
 
-    // Безопасный сброс захвата при уничтожении конкретной поверхности (для живого клиента)
     void cancel_grab_for_surface(uint64_t gid, const InputEventCallbacks& cb) noexcept {
         if (pointer_grab_.surface_gid() == gid) {
             uint64_t now_us = MonotonicClock::now_us(last_event_time_us_);
@@ -181,7 +171,6 @@ public:
         }
     }
 
-    // Сброс захвата при закрытии сессии клиента: без генерации событий мертвому клиенту!
     void cancel_grab_for_closing_session(uint32_t sess_id) noexcept {
         if (pointer_grab_.session_id() == sess_id) {
             pointer_grab_.reset();
@@ -189,6 +178,18 @@ public:
         if (keyboard_state_.session_id() == sess_id) {
             keyboard_state_.reset();
         }
+    }
+
+    core::Result<void> cancel_all_input(const InputEventCallbacks& cb) noexcept {
+        auto res = set_keyboard_focus(0, 0, 0, cb);
+        if (!res) return res;
+
+        uint64_t now_us = MonotonicClock::now_us(last_event_time_us_);
+        auto p_batch = pointer_grab_.cancel_grab(now_us);
+        if (p_batch.has_events()) {
+            safe_invoke(p_batch.session_id, cb, [&]() { return cb.dispatch_synthetic_pointer_releases(p_batch); });
+        }
+        return {};
     }
 
     [[nodiscard]] uint32_t grab_session_id() const noexcept { return pointer_grab_.session_id(); }
@@ -374,9 +375,7 @@ private:
     SeatDeviceRegistry device_registry_;
     PointerGrabState pointer_grab_;
     KeyboardFocusState keyboard_state_;
-#if defined(__linux__)
     struct udev* udev_{nullptr};
-#endif
     struct libinput* li_{nullptr};
     uint32_t screen_w_{0}, screen_h_{0};
     double cursor_x_{0.0}, cursor_y_{0.0};

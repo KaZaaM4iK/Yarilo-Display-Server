@@ -243,7 +243,9 @@ CMakeFiles/yarilo.dir/src/core/surface.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h \
  /usr/include/linux/falloc.h /usr/include/linux/openat2.h \
  /usr/include/x86_64-linux-gnu/bits/openat2.h \
- /usr/include/libdrm/drm_fourcc.h /usr/include/c++/15/unordered_map \
+ /usr/include/libdrm/drm_fourcc.h \
+ /tank/data/project/Yarilo/include/platform/input/types.hpp \
+ /usr/include/c++/15/unordered_map \
  /usr/include/c++/15/bits/unordered_map.h \
  /usr/include/c++/15/bits/hashtable.h \
  /usr/include/c++/15/bits/hashtable_policy.h \

@@ -25,7 +25,7 @@ public:
 
     // Доступ к дескриптору и имени места ввода для подсистемы libinput
     [[nodiscard]] libseat* handle() const noexcept { return seat_; }
-    [[nodiscard]] const char* name() const noexcept { return libseat_get_seat_name(seat_); }
+    [[nodiscard]] const char* name() const noexcept { return libseat_seat_name(seat_); }
 
 private:
     Seat(libseat* seat, ActivationCallback callback) noexcept;

@@ -114,7 +114,8 @@ struct WmConfigureSurfacePayload {
         WmConfigureSurfacePayload p; p.global_surface_id = read_le64(buf.data() + 0); p.server_uid = read_le64(buf.data() + 8);
         p.x = static_cast<int32_t>(read_le32(buf.data() + 16)); p.y = static_cast<int32_t>(read_le32(buf.data() + 20));
         p.z_index = read_le32(buf.data() + 24); p.mapped = read_le32(buf.data() + 28);
-        if (p.mapped != 0 && p.mapped != 1) return std::nullopt; return p;
+        if (p.mapped != 0 && p.mapped != 1) return std::nullopt;
+        return p;
     }
 };
 
