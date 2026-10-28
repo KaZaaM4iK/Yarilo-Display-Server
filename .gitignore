@@ -18,4 +18,5 @@
 
 .clinerules/
 
-build/
+# Build artifacts
+/build/
