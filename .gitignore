@@ -15,3 +15,7 @@
 *.log
 
 Архитектура.md
+
+.clinerules/
+
+build/
