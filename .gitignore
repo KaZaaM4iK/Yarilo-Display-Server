@@ -1,22 +1,15 @@
-# ===== Cargo / Rust =====
-/target
-/debug
-**/*.rs.bk
-*.pdb
-**/mutants.out*/
-
-# ===== Project-specific =====
-# Пока проект в активной разработке — lock не коммитим
-/Cargo.lock
-
-# ===== IDE / Editor =====
-.idea/
-*.swp
-*.log
-
-Архитектура.md
-
-.clinerules/
-
 # Build artifacts
 /build/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Compiled binaries and object files
+*.o
+*.a
+*.so
+
+/.clinerules/
