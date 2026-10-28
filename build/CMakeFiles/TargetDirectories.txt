@@ -1,5 +1,0 @@
-/tank/data/project/Yarilo/build/CMakeFiles/yarilo.dir
-/tank/data/project/Yarilo/build/CMakeFiles/yarilo_client.dir
-/tank/data/project/Yarilo/build/CMakeFiles/yarilo_wm.dir
-/tank/data/project/Yarilo/build/CMakeFiles/edit_cache.dir
-/tank/data/project/Yarilo/build/CMakeFiles/rebuild_cache.dir
