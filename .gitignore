@@ -12,4 +12,10 @@ Makefile
 *.a
 *.so
 
+# Local editor and AI agent settings
+/.vscode/
 /.clinerules/
+
+
+# Private architecture documentation
+/Архитектура.md
