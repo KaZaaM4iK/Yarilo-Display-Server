@@ -4,18 +4,82 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <linux/input-event-codes.h>
 #include <poll.h>
 #include <cstring>
 #include <cerrno>
 #include <print>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <array>
 #include <chrono>
+#include <unordered_set>
 #include <thread>
 #include <algorithm>
 #include <utility>
+#include <stdexcept>
+
+// Локальный RAII-guard для сокета, чтобы не зависеть от серверного core::UniqueFd
+struct ScopedFd {
+    int fd{-1};
+    explicit ScopedFd(int f) noexcept : fd(f) {}
+    ~ScopedFd() noexcept { if (fd >= 0) ::close(fd); }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    int get() const noexcept { return fd; }
+};
+
+struct TestConfig {
+    std::string client_name{"Client"};
+    bool expect_motion{false};
+    bool expect_no_motion{false};
+    bool expect_out_of_bounds{false};
+    int input_timeout_ms{500};
+};
+
+
+static constexpr uint64_t FIRST_COMMIT_SEQ = 11;
+struct TestMetrics {
+    uint64_t current_seq{FIRST_COMMIT_SEQ - 1};
+    uint64_t last_presented_seq{0};
+    uint64_t confirmed_presented_count{0};
+    uint32_t commits_sent_count{0};
+
+    uint64_t motion_events_count{0};
+    uint64_t inside_bounds_motion_count{0};
+    uint64_t outside_bounds_motion_count{0};
+    uint64_t button_events_count{0};
+    uint64_t key_events_count{0};
+    uint64_t protocol_errors_count{0};
+
+    // Drag state machine для --expect-out-of-bounds
+    enum class DragState {
+        WAIT_PRESS,           // Ожидается нажатие BTN_LEFT, курсор внутри
+        PRESSED,              // Кнопка нажата, ожидается движение за границы
+        DRAGGED_OUTSIDE,      // Движение за границы при удерживаемой кнопке подтверждено
+        RELEASED,             // Отпускание после подтверждённого drag (терминальное)
+        FAILED                // Нарушена последовательность (терминальное)
+    };
+    DragState drag_state{DragState::WAIT_PRESS};
+    bool inside_motion_received_before_outside{false};
+    bool cursor_position_known{false};
+    bool cursor_inside_window{false};
+    int32_t cursor_x{0};
+    int32_t cursor_y{0};
+
+    // Диагностика FramePresented
+    uint64_t duplicate_presented_count{0};
+    uint64_t out_of_order_presented_count{0};
+    std::unordered_set<uint64_t> confirmed_presented_seqs;
+
+    std::vector<std::string> fail_reasons;
+
+    void add_fail(const std::string& reason) {
+        fail_reasons.push_back(reason);
+    }
+};
 
 class ClientBuffer {
 public:
@@ -60,13 +124,14 @@ public:
             return false;
         }
 
+        ptr_ = addr;
+        size_ = size;
+
         if (::fcntl(fd_, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) != 0) {
             reset();
             return false;
         }
 
-        ptr_ = addr;
-        size_ = size;
         is_available_ = true;
         active_commit_seq_ = 0;
         return true;
@@ -104,25 +169,26 @@ private:
 
 static bool receive_expected_packet(int sock_fd, yarilo::ipc::MessageType expected_type, 
                                     uint64_t expected_seq, size_t expected_payload_len,
-                                    std::vector<std::byte>& out_payload) 
+                                    std::vector<std::byte>& out_payload, TestMetrics& metrics) 
 {
     pollfd pfd{.fd = sock_fd, .events = POLLIN, .revents = 0};
     while (true) {
         int ret = ::poll(&pfd, 1, 2000);
         if (ret < 0 && errno == EINTR) continue;
-        if (ret <= 0) return false;
-
+        if (ret <= 0) {
+            metrics.add_fail("Poll timeout or error during handshake");
+            return false;
+        }
         if (pfd.revents & POLLIN) break;
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            metrics.add_fail("Socket error/EOF during handshake");
+            return false;
+        }
     }
 
     std::vector<std::byte> buf(yarilo::ipc::HEADER_SIZE + expected_payload_len + 16);
-    iovec iov{};
-    iov.iov_base = buf.data();
-    iov.iov_len  = buf.size();
-
+    iovec iov{ .iov_base = buf.data(), .iov_len = buf.size() };
     msghdr msg{};
-    std::memset(&msg, 0, sizeof(msg));
     msg.msg_iov    = &iov;
     msg.msg_iovlen = 1;
 
@@ -133,20 +199,27 @@ static bool receive_expected_packet(int sock_fd, yarilo::ipc::MessageType expect
         break;
     }
 
-    if (n < 0 || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) return false;
-
+    if (n <= 0) {
+        metrics.add_fail("Socket EOF or read error");
+        return false;
+    }
+    if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
+        metrics.add_fail("Truncated packet received");
+        return false;
+    }
     if (static_cast<size_t>(n) != yarilo::ipc::HEADER_SIZE + expected_payload_len) {
+        metrics.add_fail("Packet length mismatch");
         return false;
     }
 
     auto hdr = yarilo::ipc::MessageHeader::decode(std::span<const std::byte>(buf.data(), yarilo::ipc::HEADER_SIZE));
-    if (!hdr) return false;
+    if (!hdr || hdr->magic != yarilo::ipc::PROTOCOL_MAGIC || hdr->version != yarilo::ipc::PROTOCOL_VERSION) {
+        metrics.add_fail("Invalid protocol header");
+        return false;
+    }
 
-    if (hdr->magic != yarilo::ipc::PROTOCOL_MAGIC ||
-        hdr->version != yarilo::ipc::PROTOCOL_VERSION ||
-        hdr->type != expected_type ||
-        hdr->sequence != expected_seq ||
-        hdr->length != expected_payload_len) {
+    if (hdr->type != expected_type || hdr->sequence != expected_seq || hdr->length != expected_payload_len) {
+        metrics.add_fail("Unexpected packet type, seq or length");
         return false;
     }
 
@@ -157,24 +230,29 @@ static bool receive_expected_packet(int sock_fd, yarilo::ipc::MessageType expect
     return true;
 }
 
-int main() {
-    std::println("Starting Yarilo v0.4 Presentation Client (Strict Validation)...");
-
+void run_test(const TestConfig& config, TestMetrics& metrics) {
     const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
-    if (!runtime_dir) return 1;
+    if (!runtime_dir) {
+        metrics.add_fail("XDG_RUNTIME_DIR not set");
+        return;
+    }
     std::string path = std::string(runtime_dir) + "/yarilo-0";
 
     int sock_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (sock_fd < 0) return 1;
+    if (sock_fd < 0) {
+        metrics.add_fail("socket() failed");
+        return;
+    }
+
+    ScopedFd socket_guard(sock_fd);
 
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (::connect(sock_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        std::println(stderr, "Connect failed: {}", std::strerror(errno));
-        ::close(sock_fd);
-        return 1;
+        metrics.add_fail(std::string("Connect failed: ") + std::strerror(errno));
+        return;
     }
 
     // 1. Handshake
@@ -186,29 +264,40 @@ int main() {
         .length   = yarilo::ipc::CreateSurfacePayload::ENCODED_SIZE,
         .sequence = 1,
     };
-    if (!create_hdr.encode(create_packet)) return 1;
+    if (!create_hdr.encode(create_packet)) { 
+        metrics.add_fail("Encode CreateSurface failed"); 
+        return; 
+    }
     yarilo::ipc::write_le32(create_packet + yarilo::ipc::HEADER_SIZE, 1);
     
-    if (::send(sock_fd, create_packet, sizeof(create_packet), MSG_NOSIGNAL) != sizeof(create_packet)) return 1;
+    if (::send(sock_fd, create_packet, sizeof(create_packet), MSG_NOSIGNAL) != sizeof(create_packet)) {
+        metrics.add_fail("Send CreateSurface failed");
+        return;
+    }
 
     std::vector<std::byte> ack_payload;
-    if (!receive_expected_packet(sock_fd, yarilo::ipc::MessageType::SurfaceCreated, 1, 4, ack_payload)) {
-        std::println(stderr, "Client Fatal: Failed to receive valid SurfaceCreated handshake");
-        ::close(sock_fd);
-        return 1;
+    if (!receive_expected_packet(sock_fd, yarilo::ipc::MessageType::SurfaceCreated, 1, 4, ack_payload, metrics)) {
+        return;
     }
+    
     uint32_t ack_surface_id = yarilo::ipc::read_le32(ack_payload.data());
-    if (ack_surface_id != 1) return 1;
+    if (ack_surface_id != 1) {
+        metrics.add_fail("Invalid surface_id returned from server");
+        return;
+    }
     std::println("[1/3] Surface registered.");
 
-    // 2. Двойная буферизация
+    // 2. Буферизация
     constexpr uint32_t W = 600;
     constexpr uint32_t H = 400;
     constexpr uint32_t STRIDE = W * 4;
     constexpr size_t BUF_SIZE = STRIDE * H;
-
     std::array<ClientBuffer, 2> pool;
-    if (!pool[0].allocate(BUF_SIZE) || !pool[1].allocate(BUF_SIZE)) return 1;
+
+    if (!pool[0].allocate(BUF_SIZE) || !pool[1].allocate(BUF_SIZE)) {
+        metrics.add_fail("SHM allocation failed");
+        return;
+    }
 
     auto attach_buffer = [&](uint32_t buffer_id, int fd, uint64_t seq) -> bool {
         std::byte attach_packet[yarilo::ipc::HEADER_SIZE + yarilo::ipc::AttachBufferPayload::ENCODED_SIZE];
@@ -231,10 +320,8 @@ int main() {
         yarilo::ipc::write_le64(p + 24, 0);
 
         char cmsg_buf[CMSG_SPACE(sizeof(int))]{};
-        std::memset(cmsg_buf, 0, sizeof(cmsg_buf));
         iovec iov{ .iov_base = attach_packet, .iov_len = sizeof(attach_packet) };
         msghdr msg{};
-        std::memset(&msg, 0, sizeof(msg));
         msg.msg_iov        = &iov;
         msg.msg_iovlen     = 1;
         msg.msg_control    = cmsg_buf;
@@ -250,25 +337,23 @@ int main() {
         return ::sendmsg(sock_fd, &msg, MSG_NOSIGNAL) == sizeof(attach_packet);
     };
 
-    if (!attach_buffer(1, pool[0].fd(), 2) || !attach_buffer(2, pool[1].fd(), 3)) return 1;
+    if (!attach_buffer(1, pool[0].fd(), 2) || !attach_buffer(2, pool[1].fd(), 3)) {
+        metrics.add_fail("AttachBuffer sendmsg failed");
+        return;
+    }
     std::println("[2/3] Buffer pool attached.");
 
-    // 3. Анимация со строгой валидацией FramePresented
-    std::println("[3/3] Streaming 300 frames with hardware page-flip tracking...");
+    std::println("[3/3] Streaming 300 frames with strict input verification...");
 
     int box_x = 50, box_y = 50;
     int box_vx = 6, box_vy = 4;
     constexpr int BOX_SIZE = 120;
 
-    uint64_t current_seq = 10;
-    uint64_t last_presented_seq = 0;
-    uint64_t confirmed_presented_count = 0;
     pollfd pfd{.fd = sock_fd, .events = POLLIN, .revents = 0};
 
     auto render_frame = [&](ClientBuffer& buf) {
         uint32_t* p = buf.pixels();
         std::fill_n(p, W * H, 0x00101828);
-
         for (uint32_t y = 0; y < H; ++y) {
             for (uint32_t x = 0; x < W; ++x) {
                 if (x < 4 || x >= W - 4 || y < 4 || y >= H - 4) {
@@ -276,7 +361,6 @@ int main() {
                 }
             }
         }
-
         for (int y = box_y; y < box_y + BOX_SIZE; ++y) {
             if (y >= 0 && y < static_cast<int>(H)) {
                 for (int x = box_x; x < box_x + BOX_SIZE; ++x) {
@@ -292,67 +376,194 @@ int main() {
         while (true) {
             int ret = ::poll(&pfd, 1, timeout_ms);
             if (ret < 0 && errno == EINTR) continue;
-            if (ret < 0) return false;
+            if (ret < 0) { metrics.add_fail("poll() error in event loop"); return false; }
             if (ret == 0) return true;
 
             if (pfd.revents & POLLIN) {
-                std::byte reply[128];
-                ssize_t bytes_recv = ::recv(sock_fd, reply, sizeof(reply), 0);
-                if (bytes_recv < static_cast<ssize_t>(yarilo::ipc::HEADER_SIZE)) return false;
+                std::byte reply[256];
+                iovec iov{ .iov_base = reply, .iov_len = sizeof(reply) };
+                msghdr msg{};
+                msg.msg_iov = &iov;
+                msg.msg_iovlen = 1;
+
+                ssize_t bytes_recv = ::recvmsg(sock_fd, &msg, 0);
+                if (bytes_recv < 0) {
+                    if (errno == EINTR) continue;
+                    metrics.add_fail("recvmsg error"); 
+                    return false;
+                }
+                if (bytes_recv == 0) { 
+                    metrics.add_fail("Socket EOF"); 
+                    return false; 
+                }
+
+                if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
+                    metrics.add_fail("Message truncated in recvmsg");
+                    metrics.protocol_errors_count++; return false;
+                }
+
+                if (bytes_recv < static_cast<ssize_t>(yarilo::ipc::HEADER_SIZE)) {
+                    metrics.add_fail("Message shorter than header");
+                    metrics.protocol_errors_count++; return false;
+                }
 
                 auto hdr = yarilo::ipc::MessageHeader::decode(
                     std::span<const std::byte>(reply, yarilo::ipc::HEADER_SIZE));
                 if (!hdr || hdr->magic != yarilo::ipc::PROTOCOL_MAGIC || hdr->version != yarilo::ipc::PROTOCOL_VERSION) {
-                    return false;
+                    metrics.add_fail("Invalid magic or version");
+                    metrics.protocol_errors_count++; return false;
                 }
 
                 if (bytes_recv != static_cast<ssize_t>(yarilo::ipc::HEADER_SIZE + hdr->length)) {
-                    return false;
+                    metrics.add_fail("Payload length mismatch");
+                    metrics.protocol_errors_count++; return false;
                 }
+
+                const std::byte* payload = reply + yarilo::ipc::HEADER_SIZE;
 
                 if (hdr->type == yarilo::ipc::MessageType::BufferReleased) {
                     if (hdr->length != yarilo::ipc::BufferReleasedPayload::ENCODED_SIZE) {
-                        return false;
+                        metrics.add_fail("Bad BufferReleased length"); metrics.protocol_errors_count++; return false;
                     }
-
-                    const std::byte* payload = reply + yarilo::ipc::HEADER_SIZE;
-
                     const uint32_t surface_id = yarilo::ipc::read_le32(payload);
                     const uint32_t buffer_id = yarilo::ipc::read_le32(payload + 4);
                     const uint64_t commit_seq = yarilo::ipc::read_le64(payload + 8);
 
-                    if (surface_id == 1 && buffer_id >= 1 && buffer_id <= 2) {
-                        auto& b = pool[buffer_id - 1];
-                        if (b.active_seq() == commit_seq) {
-                            b.set_available(true);
-                        }
+                    if (surface_id != 1 || buffer_id < 1 || buffer_id > 2) {
+                        metrics.add_fail("BufferReleased: invalid surface_id or buffer_id");
+                        metrics.protocol_errors_count++; return false;
                     }
+                    if (commit_seq == 0) {
+                        metrics.add_fail("BufferReleased: zero commit_seq");
+                        metrics.protocol_errors_count++; return false;
+                    }
+                    auto& b = pool[buffer_id - 1];
+                    if (b.active_seq() != commit_seq) {
+                        metrics.add_fail("BufferReleased: commit_seq mismatch");
+                        metrics.protocol_errors_count++; return false;
+                    }
+                    b.set_available(true);
                 } else if (hdr->type == yarilo::ipc::MessageType::FramePresented) {
                     if (hdr->length != yarilo::ipc::FramePresentedPayload::ENCODED_SIZE) {
+                        metrics.add_fail("Bad FramePresented length"); metrics.protocol_errors_count++; return false;
+                    }
+                    const uint32_t surface_id = yarilo::ipc::read_le32(payload);
+                    const uint64_t commit_seq = yarilo::ipc::read_le64(payload + 4);
+
+                    if (surface_id != 1) {
+                        metrics.add_fail("FramePresented: invalid surface_id");
+                        metrics.protocol_errors_count++; return false;
+                    }
+
+                    if (commit_seq == 0) {
+                        metrics.add_fail("FramePresented: zero commit_seq");
+                        metrics.protocol_errors_count++;
+                    } else if (commit_seq > metrics.current_seq) {
+                        metrics.add_fail("FramePresented: commit_seq exceeds last sent commit");
+                        metrics.protocol_errors_count++;
+                    } else if (commit_seq < FIRST_COMMIT_SEQ) {
+                        metrics.add_fail("FramePresented: commit_seq for uncommitted buffer");
+                        metrics.protocol_errors_count++;
+                    } else if (!metrics.confirmed_presented_seqs.insert(commit_seq).second) {
+                        metrics.duplicate_presented_count++;
+                    } else {
+                        metrics.confirmed_presented_count++;
+                        if (commit_seq < metrics.last_presented_seq) {
+                            metrics.out_of_order_presented_count++;
+                        }
+                        if (commit_seq > metrics.last_presented_seq) {
+                            metrics.last_presented_seq = commit_seq;
+                        }
+                    }
+                } else if (hdr->type == yarilo::ipc::MessageType::PointerMotion) {
+                    auto p = yarilo::ipc::PointerMotionPayload::decode(std::span<const std::byte>(payload, hdr->length));
+                    if (!p) {
+                        metrics.add_fail("Malformed PointerMotionPayload");
+                        metrics.protocol_errors_count++;
                         return false;
                     }
 
-                    const std::byte* payload = reply + yarilo::ipc::HEADER_SIZE;
+                    metrics.motion_events_count++;
 
-                    const uint32_t surface_id = yarilo::ipc::read_le32(payload);
-                    const uint64_t commit_seq = yarilo::ipc::read_le64(payload + 4);
-                    // Поле presentation_time_ns занимает следующие 8 байт.
-                    const uint64_t presentation_time_ns = yarilo::ipc::read_le64(payload + 12);
-                    (void)presentation_time_ns;
+                    bool inside = (p->surface_x >= 0 && p->surface_x < static_cast<int32_t>(W) &&
+                                   p->surface_y >= 0 && p->surface_y < static_cast<int32_t>(H));
 
-                    if (surface_id == 1 &&
-                        commit_seq > last_presented_seq &&
-                        commit_seq <= current_seq) {
-                        last_presented_seq = commit_seq;
-                        confirmed_presented_count++;
+                    // Обновляем текущие координаты курсора (всегда)
+                    metrics.cursor_x = p->surface_x;
+                    metrics.cursor_y = p->surface_y;
+                    metrics.cursor_inside_window = inside;
+                    metrics.cursor_position_known = true;
+
+                    if (inside) {
+                        metrics.inside_bounds_motion_count++;
+                        // Фиксируем внутриоконное движение ТОЛЬКО до первого выхода за границы
+                        if (metrics.drag_state == TestMetrics::DragState::PRESSED &&
+                            !metrics.inside_motion_received_before_outside) {
+                            metrics.inside_motion_received_before_outside = true;
+                        }
                     } else {
-                        std::println(stderr,
-                            "Client Warning: Non-monotonic or invalid FramePresented sequence");
+                        metrics.outside_bounds_motion_count++;
+                        if (metrics.drag_state == TestMetrics::DragState::PRESSED) {
+                            metrics.drag_state = TestMetrics::DragState::DRAGGED_OUTSIDE;
+                        }
                     }
+
+                    if (metrics.motion_events_count % 10 == 1) {
+                        std::println("  -> [Input] {} Motion #{} at local ({}, {}) time={}us",
+                                     config.client_name, metrics.motion_events_count, p->surface_x, p->surface_y, p->timestamp_us);
+                    }
+                } else if (hdr->type == yarilo::ipc::MessageType::PointerButton) {
+                    auto p = yarilo::ipc::PointerButtonPayload::decode(std::span<const std::byte>(payload, hdr->length));
+                    if (!p) {
+                        metrics.add_fail("Malformed PointerButtonPayload"); metrics.protocol_errors_count++; return false;
+                    }
+                    metrics.button_events_count++;
+                    std::println("  -> [Input] {} Button btn={} state={} time={}us", 
+                                 config.client_name, p->button, p->state, p->timestamp_us);
+
+                    // Drag state machine для --expect-out-of-bounds
+                    if (p->button == BTN_LEFT) {
+                        // Терминальные состояния — игнорируем последующие события
+                        if (metrics.drag_state == TestMetrics::DragState::FAILED ||
+                            metrics.drag_state == TestMetrics::DragState::RELEASED) {
+                            // Автомат завершён, не меняем состояние
+                        } else if (p->state == 1) { // Press
+                            if (metrics.drag_state == TestMetrics::DragState::WAIT_PRESS) {
+                                if (!metrics.cursor_position_known || !metrics.cursor_inside_window) {
+                                    metrics.drag_state = TestMetrics::DragState::FAILED;
+                                } else {
+                                    metrics.drag_state = TestMetrics::DragState::PRESSED;
+                                }
+                            } else {
+                                // Любое нажатие вне WAIT_PRESS — нарушение
+                                metrics.drag_state = TestMetrics::DragState::FAILED;
+                            }
+                        } else { // Release
+                            if (metrics.drag_state == TestMetrics::DragState::WAIT_PRESS) {
+                                metrics.drag_state = TestMetrics::DragState::FAILED;
+                            } else if (metrics.drag_state == TestMetrics::DragState::PRESSED) {
+                                // Отпускание до выхода за границы
+                                metrics.drag_state = TestMetrics::DragState::FAILED;
+                            } else if (metrics.drag_state == TestMetrics::DragState::DRAGGED_OUTSIDE) {
+                                metrics.drag_state = TestMetrics::DragState::RELEASED;
+                            }
+                        }
+                    }
+                } else if (hdr->type == yarilo::ipc::MessageType::KeyboardKey) {
+                    auto p = yarilo::ipc::KeyboardKeyPayload::decode(std::span<const std::byte>(payload, hdr->length));
+                    if (!p) {
+                        metrics.add_fail("Malformed KeyboardKeyPayload"); metrics.protocol_errors_count++; return false;
+                    }
+                    metrics.key_events_count++;
+                    std::println("  -> [Input] {} Key scancode={} state={} time={}us", 
+                                 config.client_name, p->key, p->state, p->timestamp_us);
                 } else if (hdr->type == yarilo::ipc::MessageType::ProtocolError) {
-                    return false;
+                    metrics.add_fail("Server returned ProtocolError"); metrics.protocol_errors_count++; return false;
+                } else {
+                    metrics.add_fail("Unexpected message type"); metrics.protocol_errors_count++; return false;
                 }
             } else if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                metrics.add_fail("Socket POLLERR/HUP"); 
                 return false;
             }
             timeout_ms = 0;
@@ -368,23 +579,25 @@ int main() {
     for (int frame = 0; frame < 300; ++frame) {
         auto deadline = get_client_deadline(frame + 1);
 
-        box_x += box_vx;
-        box_y += box_vy;
+        box_x += box_vx; box_y += box_vy;
         if (box_x <= 4 || box_x + BOX_SIZE >= static_cast<int>(W) - 4) box_vx = -box_vx;
         if (box_y <= 4 || box_y + BOX_SIZE >= static_cast<int>(H) - 4) box_vy = -box_vy;
 
-        if (!handle_incoming_events(0)) return 1;
+        if (!handle_incoming_events(0)) return;
 
         auto wait_start = std::chrono::steady_clock::now();
         while (!pool[0].is_available() && !pool[1].is_available()) {
-            if (!handle_incoming_events(10)) return 1;
-            if (std::chrono::steady_clock::now() - wait_start > std::chrono::milliseconds(3000)) return 1;
+            if (!handle_incoming_events(10)) return;
+            if (std::chrono::steady_clock::now() - wait_start > std::chrono::milliseconds(3000)) {
+                metrics.add_fail("Timeout waiting for free buffer");
+                return;
+            }
         }
 
         int target_idx = pool[0].is_available() ? 0 : 1;
         auto& buf = pool[target_idx];
         
-        uint64_t seq = ++current_seq;
+        uint64_t seq = ++metrics.current_seq;
         buf.set_available(false);
         buf.set_active_seq(seq);
         render_frame(buf);
@@ -397,7 +610,10 @@ int main() {
             .length   = yarilo::ipc::CommitSurfacePayload::ENCODED_SIZE,
             .sequence = seq,
         };
-        if (!commit_hdr.encode(commit_packet)) return 1;
+        if (!commit_hdr.encode(commit_packet)) { 
+            metrics.add_fail("Encode CommitSurface failed"); 
+            return; 
+        }
 
         std::byte* p = commit_packet + yarilo::ipc::HEADER_SIZE;
         yarilo::ipc::write_le32(p + 0, 1);
@@ -405,9 +621,10 @@ int main() {
         yarilo::ipc::write_le64(p + 8, seq);
 
         if (::send(sock_fd, commit_packet, sizeof(commit_packet), MSG_NOSIGNAL) != sizeof(commit_packet)) {
-            buf.set_available(true);
-            return 1;
+            metrics.add_fail("Send CommitSurface failed"); 
+            return;
         }
+        metrics.commits_sent_count++;
 
         auto now = std::chrono::steady_clock::now();
         if (deadline > now) {
@@ -416,11 +633,122 @@ int main() {
     }
 
     auto drain_start = std::chrono::steady_clock::now();
-    while (std::chrono::steady_clock::now() - drain_start < std::chrono::milliseconds(500)) {
-        handle_incoming_events(20);
+    while (std::chrono::steady_clock::now() - drain_start < std::chrono::milliseconds(config.input_timeout_ms)) {
+        if (!handle_incoming_events(20)) return;
+    }
+}
+
+int main(int argc, char** argv) {
+    TestConfig config;
+    bool client_id_set = false;
+    
+    // Строгий парсер аргументов
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg == "--expect-motion") {
+            config.expect_motion = true;
+        } else if (arg == "--expect-no-motion") {
+            config.expect_no_motion = true;
+        } else if (arg == "--expect-out-of-bounds") {
+            config.expect_out_of_bounds = true;
+        } else if (arg == "--input-timeout-ms") {
+            if (i + 1 >= argc) {
+                std::println(stderr, "Client Fatal: Missing value for --input-timeout-ms");
+                return 1;
+            }
+            std::string val = argv[++i];
+            size_t pos = 0;
+            try {
+                config.input_timeout_ms = std::stoi(val, &pos);
+                if (pos != val.length() || config.input_timeout_ms <= 0) {
+                    throw std::invalid_argument("Invalid or non-positive timeout");
+                }
+            } catch (...) {
+                std::println(stderr, "Client Fatal: Invalid value for --input-timeout-ms");
+                return 1;
+            }
+        } else if (arg.starts_with("--")) {
+            std::println(stderr, "Client Fatal: Unknown argument {}", arg);
+            return 1;
+        } else {
+            if (client_id_set) {
+                std::println(stderr, "Client Fatal: Multiple client identifiers provided.");
+                return 1;
+            }
+            config.client_name = "Client " + std::string(arg);
+            client_id_set = true;
+        }
     }
 
-    std::println("\nClient Summary: 300 committed, {} verified presented by hardware vblank.", confirmed_presented_count);
-    ::close(sock_fd);
-    return 0;
+    if (config.expect_motion && config.expect_no_motion) {
+        std::println(stderr, "Client Fatal: --expect-motion and --expect-no-motion are mutually exclusive.");
+        return 1;
+    }
+
+    if (config.expect_no_motion && config.expect_out_of_bounds) {
+        std::println(stderr, "Client Fatal: --expect-no-motion and --expect-out-of-bounds are mutually exclusive.");
+        return 1;
+    }
+
+    TestMetrics metrics;
+    run_test(config, metrics);
+
+    // Валидация метрик после завершения сетевой фазы
+    if (metrics.confirmed_presented_count != metrics.commits_sent_count) {
+        metrics.add_fail(std::string("Frame presentation count mismatch: sent=") + 
+                         std::to_string(metrics.commits_sent_count) + 
+                         ", confirmed=" + std::to_string(metrics.confirmed_presented_count));
+    }
+
+    if (config.expect_motion) {
+        if (metrics.inside_bounds_motion_count == 0) {
+            metrics.add_fail("Expected inside-bounds motion, got 0");
+        }
+        if (!config.expect_out_of_bounds && metrics.outside_bounds_motion_count > 0) {
+            metrics.add_fail("Got outside-bounds motion when strictly not expected");
+        }
+    }
+
+    if (config.expect_out_of_bounds) {
+        if (!metrics.inside_motion_received_before_outside) {
+            metrics.add_fail("Expected out-of-bounds drag: inside motion before drag not received");
+        }
+        if (metrics.outside_bounds_motion_count == 0) {
+            metrics.add_fail("Expected out-of-bounds drag: no outside-bounds motion");
+        }
+        if (metrics.drag_state != TestMetrics::DragState::RELEASED) {
+            metrics.add_fail("Drag sequence incomplete: press -> inside motion -> outside motion while pressed -> release not confirmed");
+        }
+    }
+    
+    if (config.expect_no_motion && metrics.motion_events_count > 0) {
+        metrics.add_fail(std::string("Expected NO motion events, but received ") + 
+                         std::to_string(metrics.motion_events_count));
+    }
+
+    bool success = metrics.fail_reasons.empty() && (metrics.protocol_errors_count == 0);
+
+    std::println("\n=================================================");
+    std::println("  {} Verification Summary:                      ", config.client_name);
+    if (!metrics.fail_reasons.empty()) {
+        for (const auto& reason : metrics.fail_reasons) {
+            std::println("    [ERROR]: {}", reason);
+        }
+    } else {
+        std::println("    [OK]: No fatal transport or protocol errors.");
+    }
+    std::println("    Commits sent:       {}", metrics.commits_sent_count);
+    std::println("    VBlank verified:    {}", metrics.confirmed_presented_count);
+    std::println("    Motion total:       {}", metrics.motion_events_count);
+    std::println("    Motion inside win:  {}", metrics.inside_bounds_motion_count);
+    std::println("    Motion out of win:  {}", metrics.outside_bounds_motion_count);
+    std::println("    Button events:      {}", metrics.button_events_count);
+    std::println("    Key events:         {}", metrics.key_events_count);
+    std::println("    Protocol errors:    {}", metrics.protocol_errors_count);
+    std::println("    Duplicate presented:{}", metrics.duplicate_presented_count);
+    std::println("    Out of order:       {}", metrics.out_of_order_presented_count);
+    std::println("    Test Verdict:       {}", success ? "[PASS]" : "[FAIL]");
+    std::println("=================================================");
+
+    return success ? 0 : 1;
 }
