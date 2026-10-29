@@ -442,6 +442,10 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                         metrics.add_fail("BufferReleased: commit_seq mismatch");
                         metrics.protocol_errors_count++; return false;
                     }
+                    if (b.is_available()) {
+                        metrics.add_fail("BufferReleased: duplicate release received");
+                        metrics.protocol_errors_count++; return false;
+                    }
                     b.set_available(true);
                 } else if (hdr->type == yarilo::ipc::MessageType::FramePresented) {
                     if (hdr->length != yarilo::ipc::FramePresentedPayload::ENCODED_SIZE) {
@@ -466,10 +470,14 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                         metrics.protocol_errors_count++;
                     } else if (!metrics.confirmed_presented_seqs.insert(commit_seq).second) {
                         metrics.duplicate_presented_count++;
+                        metrics.add_fail("FramePresented: duplicate sequence received");
+                        metrics.protocol_errors_count++;
                     } else {
                         metrics.confirmed_presented_count++;
                         if (commit_seq < metrics.last_presented_seq) {
                             metrics.out_of_order_presented_count++;
+                            metrics.add_fail("FramePresented: out-of-order sequence received");
+                            metrics.protocol_errors_count++;
                         }
                         if (commit_seq > metrics.last_presented_seq) {
                             metrics.last_presented_seq = commit_seq;
@@ -726,7 +734,10 @@ int main(int argc, char** argv) {
                          std::to_string(metrics.motion_events_count));
     }
 
-    bool success = metrics.fail_reasons.empty() && (metrics.protocol_errors_count == 0);
+    bool success = metrics.fail_reasons.empty() && 
+                   (metrics.protocol_errors_count == 0) &&
+                   (metrics.duplicate_presented_count == 0) &&
+                   (metrics.out_of_order_presented_count == 0);
 
     std::println("\n=================================================");
     std::println("  {} Verification Summary:                      ", config.client_name);

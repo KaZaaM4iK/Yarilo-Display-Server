@@ -130,13 +130,14 @@ core::Result<void> SurfaceManager::create_surface(uint32_t session_id, uint32_t 
     uint64_t next_order = global_creation_counter_ + 1;
 
     try {
-        auto [it, inserted] = surfaces_.try_emplace(global_id, Surface{
-            .server_uid = next_uid,
-            .global_id = global_id,
-            .local_id = local_id,
-            .owner_session_id = session_id,
-            .creation_order = next_order
-        });
+        auto [it, inserted] = surfaces_.try_emplace(
+            global_id,
+            next_uid,
+            global_id,
+            local_id,
+            session_id,
+            next_order
+        );
         if (!inserted) {
             return std::unexpected(core::make_error(core::ServerError::InternalStateError));
         }
