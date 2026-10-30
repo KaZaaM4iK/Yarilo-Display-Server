@@ -580,8 +580,8 @@ std::vector<MapRequestInfo> SurfaceManager::get_pending_map_requests() const {
 
 void SurfaceManager::handle_wm_disconnected() noexcept {
     for (auto& [gid, s] : surfaces_) {
+        (void)gid;
         s.is_mapped_by_wm = false;
-
         if (s.map_state == MapDeliveryState::Sent) {
             s.map_state = MapDeliveryState::Queued;
         }

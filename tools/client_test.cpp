@@ -47,6 +47,7 @@ static constexpr uint64_t FIRST_COMMIT_SEQ = 11;
 struct TestMetrics {
     uint64_t current_seq{FIRST_COMMIT_SEQ - 1};
     uint64_t last_presented_seq{0};
+    uint64_t first_presented_seq{0};
     uint64_t confirmed_presented_count{0};
     uint32_t commits_sent_count{0};
 
@@ -477,6 +478,9 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                         metrics.protocol_errors_count++;
                     } else {
                         metrics.confirmed_presented_count++;
+                        if (metrics.first_presented_seq == 0) {
+                            metrics.first_presented_seq = commit_seq;
+                        }
                         if (commit_seq < metrics.last_presented_seq) {
                             metrics.out_of_order_presented_count++;
                             metrics.add_fail("FramePresented: out-of-order sequence received");
@@ -757,22 +761,40 @@ int main(int argc, char** argv) {
         if (metrics.confirmed_presented_count > metrics.commits_sent_count) {
             metrics.add_fail("Confirmed presentations exceed sent commits");
         }
+
         if (metrics.confirmed_presented_count == 0 && metrics.commits_sent_count > 0) {
             metrics.add_fail("No frames were presented despite commits sent");
         }
-        // Строгое доказательство возобновления презентаций:
-        // Хвостовой commit_seq обязан быть показан после восстановления WM
+
+        // Проверка общего прогресса кадрового потока:
+        // наличие презентаций, их количество и достижение конца потока.
         if (metrics.commits_sent_count >= 30) {
-            uint64_t min_tail_seq = metrics.current_seq - 15;
-            if (metrics.last_presented_seq < min_tail_seq) {
-                metrics.add_fail(std::string("Presentation did not resume after WM recovery: last_presented_seq=") +
-                                 std::to_string(metrics.last_presented_seq) +
-                                 ", expected >= " + std::to_string(min_tail_seq));
+
+            // Проверка наличия первой подтверждённой презентации.
+            if (metrics.first_presented_seq == 0 &&
+                metrics.confirmed_presented_count > 0) {
+                metrics.add_fail(std::string("WM Recovery check: Initial presentation phase missing, first_seq=") +
+                                 std::to_string(metrics.first_presented_seq));
             }
-            if (metrics.confirmed_presented_count < (metrics.commits_sent_count / 2)) {
-                metrics.add_fail(std::string("Too many dropped frames during WM recovery: confirmed=") +
+
+            // Контроль того, что количество презентаций достаточно
+            // относительно количества отправленных кадров.
+            if (metrics.confirmed_presented_count > 0 &&
+                metrics.confirmed_presented_count <
+                (metrics.commits_sent_count / 2)) {
+                metrics.add_fail(std::string("WM Recovery check: Too few presentations relative to sent commits: confirmed=") +
                                  std::to_string(metrics.confirmed_presented_count) +
                                  ", sent=" + std::to_string(metrics.commits_sent_count));
+            }
+
+            // Контроль того, что презентации дошли до последних 15 кадров потока.
+            uint64_t min_tail_seq =
+                metrics.current_seq > 15 ? metrics.current_seq - 15 : 0;
+
+            if (metrics.last_presented_seq < min_tail_seq) {
+                metrics.add_fail(std::string("WM Recovery check: Presentation did not reach stream tail: last_presented_seq=") +
+                                 std::to_string(metrics.last_presented_seq) +
+                                 ", expected >= " + std::to_string(min_tail_seq));
             }
         }
     }
