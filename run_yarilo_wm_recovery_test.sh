@@ -11,31 +11,108 @@ WM2_PID=0
 CLIENT1_PID=0
 CLIENT2_PID=0
 
+TEST_RUNTIME_DIR=""
+SERVER_LOG=""
+
 cleanup() {
     local exit_code=$?
-    trap - EXIT INT TERM
-    echo "==> [CLEANUP] Stopping all running processes..."
+    trap - EXIT
+    trap ':' INT TERM
+    echo "==> [CLEANUP] Stopping running processes..."
+
+    wait_group() {
+        local pids="$1"
+        local label="$2"
+        # SIGTERM
+        local sent=0
+        for pid in $pids; do
+            if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then
+                kill -15 "$pid" 2>/dev/null || true
+                sent=1
+            fi
+        done
+        if [ "$sent" -eq 1 ]; then
+            for ((attempt = 0; attempt < 10; attempt++)); do
+                local running=0
+                for pid in $pids; do
+                    if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then running=1; break; fi
+                done
+                if [ "$running" -eq 0 ]; then return 0; fi
+                sleep 0.1
+            done
+        fi
+        # SIGKILL
+        for pid in $pids; do
+            if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then
+                echo "==> [CLEANUP] Force killing $label PID $pid"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        # Wait after SIGKILL
+        for ((attempt = 0; attempt < 10; attempt++)); do
+            local running=0
+            for pid in $pids; do
+                if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then running=1; break; fi
+            done
+            if [ "$running" -eq 0 ]; then return 0; fi
+            sleep 0.1
+        done
+        return 1
+    }
+
+    wait_group "$CLIENT1_PID $CLIENT2_PID" "client"
+    wait_group "$WM1_PID" "WM1"
+    wait_group "$WM2_PID" "WM2"
+    wait_group "$SERVER_PID" "server"
+
+    # Финальная проверка: не остались ли процессы
+    local remaining=0
     for pid in "$CLIENT1_PID" "$CLIENT2_PID" "$WM1_PID" "$WM2_PID" "$SERVER_PID"; do
         if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
+            echo "==> [CLEANUP] Process PID $pid still alive after SIGKILL"
+            remaining=1
         fi
     done
-    wait 2>/dev/null || true
+    if [ "$remaining" -eq 1 ]; then
+        echo "==> [CLEANUP] Some processes did not terminate. Preserving diagnostic artifacts."
+        exit_code=1
+    fi
+
+    if [ "$exit_code" -ne 0 ]; then
+        echo "==> [CLEANUP] Test FAILED (exit code $exit_code). Preserving diagnostic artifacts:"
+        echo "    Test runtime directory: $TEST_RUNTIME_DIR"
+        echo "    Server log:             $SERVER_LOG"
+        echo "==> [CLEANUP] Last server log lines:"
+        tail -n 20 "$SERVER_LOG" 2>/dev/null || true
+    else
+        if [ -n "$TEST_RUNTIME_DIR" ]; then rm -rf "$TEST_RUNTIME_DIR"; fi
+    fi
     exit "$exit_code"
 }
-trap cleanup EXIT INT TERM
 
-# 1. Сборка
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+TEST_RUNTIME_DIR=$(mktemp -d -t yarilo-test-b2-XXXXXX) || {
+    echo "[FAIL] Cannot create test runtime directory"
+    exit 1
+}
+chmod 0700 "$TEST_RUNTIME_DIR" || {
+    rm -rf "$TEST_RUNTIME_DIR"
+    TEST_RUNTIME_DIR=""
+    echo "[FAIL] Cannot set permissions on test runtime directory"
+    exit 1
+}
+export XDG_RUNTIME_DIR="$TEST_RUNTIME_DIR"
+SERVER_LOG="$TEST_RUNTIME_DIR/server.log"
+
 cmake --build build -j2 || exit 1
 
-# 2. Удаление старого сокета и запуск сервера в фоне
-SOCKET_PATH="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/yarilo-0"
-rm -f "$SOCKET_PATH"
-
-./build/yarilo &
+SOCKET_PATH="$TEST_RUNTIME_DIR/yarilo-0"
+stdbuf -oL ./build/yarilo > >(tee -a "$SERVER_LOG") 2>&1 &
 SERVER_PID=$!
 
-# Ожидание создания НОВОГО сокета сервером
 for i in {1..50}; do
     if [ -S "$SOCKET_PATH" ]; then break; fi
     sleep 0.1
@@ -45,62 +122,84 @@ if [ ! -S "$SOCKET_PATH" ]; then
     echo "[FAIL] Server IPC socket did not appear!"
     exit 1
 fi
-sleep 0.3
+sleep 0.2
 
-# 3. Запуск WM #1
 echo "Starting Window Manager #1..."
 ./build/yarilo_wm &
 WM1_PID=$!
-sleep 0.3
 
-if ! kill -0 "$WM1_PID" 2>/dev/null; then
-    echo "[FAIL] Window Manager #1 crashed immediately on startup!"
+WM1_READY=0
+for i in {1..30}; do
+    if grep -q "promoted to Window Manager (0 pending maps queued)" "$SERVER_LOG" 2>/dev/null; then
+        WM1_READY=1
+        break
+    fi
+    if ! kill -0 "$WM1_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+done
+
+if [ "$WM1_READY" -ne 1 ]; then
+    echo "[FAIL] Window Manager #1 failed to establish authenticated WM session!"
     exit 1
 fi
+echo "[OK] Window Manager #1 promoted and ready."
 
-# 4. Запуск Клиента 1 и Клиента 2 (с флагом --allow-dropped-frames)
-echo "Starting Client 1 (300 frames, resilient to unmapped drops)..."
+echo "Starting Client 1 and Client 2..."
 ./build/yarilo_client 1 --allow-dropped-frames &
 CLIENT1_PID=$!
-
-echo "Starting Client 2 (300 frames, resilient to unmapped drops)..."
 ./build/yarilo_client 2 --allow-dropped-frames &
 CLIENT2_PID=$!
 
-# Даем клиентам отрендерить начальную пачку кадров (~1.2 сек)
+# Даем клиентам отрендерить начальную пачку кадров до падения WM (~1.2с)
 sleep 1.2
 
-# 5. УБИВАЕМ WM #1 через SIGKILL
 echo "==> [CRASH] Killing Window Manager #1 via SIGKILL..."
 kill -9 "$WM1_PID" 2>/dev/null
 wait "$WM1_PID" 2>/dev/null || true
 WM1_PID=0
 
-# Пауза для обработки разрыва сервером (сброс active_wm_session_id)
-sleep 0.4
+WM_DISCONNECTED=0
+for i in {1..20}; do
+    if grep -q "Window Manager disconnected (Session 1)" "$SERVER_LOG" 2>/dev/null; then
+        WM_DISCONNECTED=1
+        break
+    fi
+    sleep 0.1
+done
 
-# 6. ЗАПУСКАЕМ WM #2 (Recovery)
+if [ "$WM_DISCONNECTED" -ne 1 ]; then
+    echo "[FAIL] Server failed to detect Window Manager #1 disconnection!"
+    exit 1
+fi
+echo "[OK] Server acknowledged WM #1 disconnect and reset state."
+
 echo "==> [RECOVERY] Starting Window Manager #2 (Reconnection)..."
 ./build/yarilo_wm &
 WM2_PID=$!
-sleep 0.3
 
-if ! kill -0 "$WM2_PID" 2>/dev/null; then
-    echo "[FAIL] Window Manager #2 failed to reconnect!"
+WM2_READY=0
+for i in {1..30}; do
+    if grep -q "promoted to Window Manager (2 pending maps queued)" "$SERVER_LOG" 2>/dev/null; then
+        WM2_READY=1
+        break
+    fi
+    if ! kill -0 "$WM2_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+done
+
+if [ "$WM2_READY" -ne 1 ]; then
+    echo "[FAIL] Window Manager #2 failed to recover with 2 queued map requests!"
     exit 1
 fi
+echo "[OK] WM #2 recovered: 2 pending maps successfully handed over."
 
-# 7. Ожидание завершения клиентов с таймаутом (Watchdog: 10 секунд)
 echo "Waiting for clients to finish..."
 CLIENTS_TIMEOUT=100
 while [ "$CLIENTS_TIMEOUT" -gt 0 ]; do
-    c1_running=0
-    c2_running=0
-    if kill -0 "$CLIENT1_PID" 2>/dev/null; then c1_running=1; fi
-    if kill -0 "$CLIENT2_PID" 2>/dev/null; then c2_running=1; fi
-    if [ "$c1_running" -eq 0 ] && [ "$c2_running" -eq 0 ]; then
-        break
-    fi
+    c1=0; c2=0
+    if kill -0 "$CLIENT1_PID" 2>/dev/null; then c1=1; fi
+    if kill -0 "$CLIENT2_PID" 2>/dev/null; then c2=1; fi
+    if [ "$c1" -eq 0 ] && [ "$c2" -eq 0 ]; then break; fi
     sleep 0.1
     CLIENTS_TIMEOUT=$((CLIENTS_TIMEOUT - 1))
 done
@@ -111,32 +210,28 @@ if [ "$CLIENTS_TIMEOUT" -le 0 ]; then
 fi
 
 wait "$CLIENT1_PID"
-CLIENT1_STATUS=$?
+C1_STATUS=$?
 CLIENT1_PID=0
 
 wait "$CLIENT2_PID"
-CLIENT2_STATUS=$?
+C2_STATUS=$?
 CLIENT2_PID=0
 
-if [ "$CLIENT1_STATUS" -ne 0 ] || [ "$CLIENT2_STATUS" -ne 0 ]; then
-    echo "[FAIL] Clients failed! Client 1: $CLIENT1_STATUS, Client 2: $CLIENT2_STATUS"
+if [ "$C1_STATUS" -ne 0 ] || [ "$C2_STATUS" -ne 0 ]; then
+    echo "[FAIL] Clients verification failed! Client 1: $C1_STATUS, Client 2: $C2_STATUS"
     exit 1
 fi
+echo "[OK] Both clients successfully verified Three-Phase WM Recovery."
 
-echo "[OK] Both clients finished with PASS."
-
-# 8. Ожидание штатного завершения сервера (таймаут 12 секунд, с запасом перекрывающий 15с рантайм сервера)
-SERVER_TIMEOUT=120
+SERVER_TIMEOUT=180
 while [ "$SERVER_TIMEOUT" -gt 0 ]; do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        break
-    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
     sleep 0.1
     SERVER_TIMEOUT=$((SERVER_TIMEOUT - 1))
 done
 
 if [ "$SERVER_TIMEOUT" -le 0 ]; then
-    echo "[FAIL] Server hung and did not complete within timeout!"
+    echo "[FAIL] Server did not complete session within timeout!"
     exit 1
 fi
 
@@ -144,19 +239,11 @@ wait "$SERVER_PID"
 SERVER_STATUS=$?
 SERVER_PID=0
 
-if [ "$WM2_PID" -gt 0 ]; then
-    kill -15 "$WM2_PID" 2>/dev/null || true
-    wait "$WM2_PID" 2>/dev/null || true
-    WM2_PID=0
-fi
-
 echo "================================================="
 if [ "$SERVER_STATUS" -eq 0 ]; then
-    echo "  [PASS] B2: WM Crash & Recovery Test SUCCEEDED! "
-    echo "================================================="
+    echo "  [PASS] B2: Verified WM Crash & Recovery Test SUCCEEDED! "
     exit 0
 else
     echo "  [FAIL] Server exited with error code $SERVER_STATUS"
-    echo "================================================="
     exit 1
 fi
