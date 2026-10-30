@@ -153,6 +153,8 @@ static_assert(
     "ActiveLease move construction must be noexcept for snapshot phase 2"
 );
 
+class SurfaceManagerTestAccess;
+
 class SurfaceManager {
 public:
     core::Result<void> create_surface(uint32_t session_id, uint32_t local_id);
@@ -193,6 +195,8 @@ public:
     bool surface_is_mapped(uint64_t gid) const noexcept;
 
 private:
+    friend class SurfaceManagerTestAccess;
+
     core::Result<void> validate_surface_graph_invariants(const Surface& s) const;
     std::optional<ReleaseInfo> try_release_binding(uint64_t binding_uid) noexcept;
 

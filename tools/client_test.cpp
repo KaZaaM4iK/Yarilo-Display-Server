@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <cstring>
 #include <cerrno>
+#include <csignal>
 #include <print>
 #include <cstdlib>
 #include <string>
@@ -37,6 +38,8 @@ struct TestConfig {
     bool expect_no_motion{false};
     bool expect_out_of_bounds{false};
     int input_timeout_ms{500};
+    int crash_after_commits{0};
+    bool allow_dropped_frames{false};
 };
 
 
@@ -584,7 +587,8 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
         return client_start_time + ns;
     };
 
-    for (int frame = 0; frame < 300; ++frame) {
+    const int max_frames = (config.crash_after_commits > 0) ? config.crash_after_commits : 300;
+    for (int frame = 0; frame < max_frames; ++frame) {
         auto deadline = get_client_deadline(frame + 1);
 
         box_x += box_vx; box_y += box_vy;
@@ -640,6 +644,29 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
         }
     }
 
+    if (config.crash_after_commits > 0) {
+        auto wait_start = std::chrono::steady_clock::now();
+        while (metrics.confirmed_presented_count < static_cast<uint64_t>(config.crash_after_commits)) {
+            if (!handle_incoming_events(20)) break;
+            if (std::chrono::steady_clock::now() - wait_start > std::chrono::milliseconds(3000)) {
+                metrics.add_fail("Timeout waiting for FramePresented before crash checkpoint");
+                break;
+            }
+        }
+
+        if (metrics.confirmed_presented_count == static_cast<uint64_t>(config.crash_after_commits) &&
+            metrics.fail_reasons.empty() && metrics.protocol_errors_count == 0 &&
+            metrics.duplicate_presented_count == 0 && metrics.out_of_order_presented_count == 0) 
+        {
+            std::println("  -> [CRASH CHECKPOINT] {} verified {}/{} presentations. Terminating via SIGKILL...",
+                         config.client_name, metrics.confirmed_presented_count, config.crash_after_commits);
+            ::kill(::getpid(), SIGKILL);
+        }
+
+        std::println(stderr, "  -> [ERROR] {} failed to reach clean crash checkpoint!", config.client_name);
+        return;
+    }
+
     auto drain_start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - drain_start < std::chrono::milliseconds(config.input_timeout_ms)) {
         if (!handle_incoming_events(20)) return;
@@ -675,6 +702,24 @@ int main(int argc, char** argv) {
                 std::println(stderr, "Client Fatal: Invalid value for --input-timeout-ms");
                 return 1;
             }
+            } else if (arg == "--allow-dropped-frames") {
+                config.allow_dropped_frames = true;
+            } else if (arg == "--crash-after-commits") {
+            if (i + 1 >= argc) {
+                std::println(stderr, "Client Fatal: Missing value for --crash-after-commits");
+                return 1;
+            }
+            std::string val = argv[++i];
+            size_t pos = 0;
+            try {
+                config.crash_after_commits = std::stoi(val, &pos);
+                if (pos != val.length() || config.crash_after_commits <= 0) {
+                    throw std::invalid_argument("Invalid or non-positive commit count");
+                }
+            } catch (...) {
+                std::println(stderr, "Client Fatal: Invalid value for --crash-after-commits");
+                return 1;
+            }
         } else if (arg.starts_with("--")) {
             std::println(stderr, "Client Fatal: Unknown argument {}", arg);
             return 1;
@@ -702,10 +747,34 @@ int main(int argc, char** argv) {
     run_test(config, metrics);
 
     // Валидация метрик после завершения сетевой фазы
-    if (metrics.confirmed_presented_count != metrics.commits_sent_count) {
-        metrics.add_fail(std::string("Frame presentation count mismatch: sent=") + 
-                         std::to_string(metrics.commits_sent_count) + 
-                         ", confirmed=" + std::to_string(metrics.confirmed_presented_count));
+    if (!config.allow_dropped_frames) {
+        if (metrics.confirmed_presented_count != metrics.commits_sent_count) {
+            metrics.add_fail(std::string("Frame presentation count mismatch: sent=") + 
+                             std::to_string(metrics.commits_sent_count) + 
+                             ", confirmed=" + std::to_string(metrics.confirmed_presented_count));
+        }
+    } else {
+        if (metrics.confirmed_presented_count > metrics.commits_sent_count) {
+            metrics.add_fail("Confirmed presentations exceed sent commits");
+        }
+        if (metrics.confirmed_presented_count == 0 && metrics.commits_sent_count > 0) {
+            metrics.add_fail("No frames were presented despite commits sent");
+        }
+        // Строгое доказательство возобновления презентаций:
+        // Хвостовой commit_seq обязан быть показан после восстановления WM
+        if (metrics.commits_sent_count >= 30) {
+            uint64_t min_tail_seq = metrics.current_seq - 15;
+            if (metrics.last_presented_seq < min_tail_seq) {
+                metrics.add_fail(std::string("Presentation did not resume after WM recovery: last_presented_seq=") +
+                                 std::to_string(metrics.last_presented_seq) +
+                                 ", expected >= " + std::to_string(min_tail_seq));
+            }
+            if (metrics.confirmed_presented_count < (metrics.commits_sent_count / 2)) {
+                metrics.add_fail(std::string("Too many dropped frames during WM recovery: confirmed=") +
+                                 std::to_string(metrics.confirmed_presented_count) +
+                                 ", sent=" + std::to_string(metrics.commits_sent_count));
+            }
+        }
     }
 
     if (config.expect_motion) {

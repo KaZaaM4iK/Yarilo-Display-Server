@@ -47,3 +47,18 @@ add_executable(yarilo_wm
     tools/wm_test.cpp
 )
 target_include_directories(yarilo_wm PRIVATE include)
+
+# Unit-тесты ядра Yarilo
+add_executable(test_surface_manager
+    tests/test_surface_manager.cpp
+    src/core/surface.cpp
+    src/core/error.cpp
+)
+target_include_directories(test_surface_manager PRIVATE include)
+target_link_libraries(test_surface_manager PRIVATE PkgConfig::LIBDRM)
+
+# Регистрация в CTest
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME SurfaceManager_UnitTests COMMAND test_surface_manager)
+endif()

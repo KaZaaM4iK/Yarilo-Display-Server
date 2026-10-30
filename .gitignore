@@ -19,3 +19,7 @@ Makefile
 
 # Private architecture documentation
 /Архитектура.md
+
+package.json
+package-lock.json
+node_modules/
