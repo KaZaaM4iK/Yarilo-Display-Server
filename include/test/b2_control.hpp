@@ -18,8 +18,8 @@ namespace yarilo::test::b2 {
 
 constexpr uint32_t MAGIC = 0x32425259; // YRB2
 constexpr const char* SOCKET_NAME = "yarilo-b2-control";
-constexpr uint32_t VERSION = 1;
-constexpr size_t PACKET_SIZE = 100;
+constexpr uint32_t VERSION = 2;
+constexpr size_t PACKET_SIZE = 116;
 
 enum class Type : uint32_t {
     Register = 1,
@@ -39,6 +39,11 @@ enum class Type : uint32_t {
 enum class Role : uint32_t { Server = 1, Client = 2, Coordinator = 3 };
 enum class Status : uint32_t { Ok = 0, Failed = 1 };
 
+// Register ACK contract: Type::Register + Role::Coordinator + Status::Ok;
+// message_seq echoes the request, and pid/uid/gid identify the Coordinator.
+// Receivers must authenticate those identity fields against SO_PEERCRED.
+// This ACK confirms registration only, not B2 control-plane readiness.
+
 struct Packet {
     Type type{Type::Error};
     Role role{Role::Client};
@@ -53,6 +58,8 @@ struct Packet {
     uint64_t surface_id{0};
     uint64_t server_uid{0};
     uint64_t commit_seq{0};
+    uint64_t changed_count{0};
+    uint64_t reported_count{0};
 };
 
 inline void put32(std::byte* p, uint32_t v) noexcept {
@@ -92,6 +99,8 @@ inline bool send(int fd, const Packet& p) noexcept {
     put64(b.data() + 76, p.surface_id);
     put64(b.data() + 84, p.server_uid);
     put64(b.data() + 92, p.commit_seq);
+    put64(b.data() + 100, p.changed_count);
+    put64(b.data() + 108, p.reported_count);
 
     ssize_t n = ::send(fd, b.data(), b.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
 
@@ -170,6 +179,8 @@ inline bool receive(int fd, Packet& p) noexcept {
     p.surface_id = get64(b.data() + 76);
     p.server_uid = get64(b.data() + 84);
     p.commit_seq = get64(b.data() + 92);
+    p.changed_count = get64(b.data() + 100);
+    p.reported_count = get64(b.data() + 108);
 
     return true;
 }

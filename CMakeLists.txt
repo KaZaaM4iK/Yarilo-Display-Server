@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(YARILO_B2_TEST_CONTROL "Build and enable B2 recovery test control plane" OFF)
+if(YARILO_B2_TEST_CONTROL AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "YARILO_B2_TEST_CONTROL requires Linux (SO_PEERCRED)")
+endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic -Werror=return-type)
 
