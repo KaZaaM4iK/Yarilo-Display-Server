@@ -1,4 +1,8 @@
 #include "ipc/protocol.hpp"
+#if defined(YARILO_B2_TEST_CONTROL)
+#include "test/b2_control.hpp"
+namespace b2 = yarilo::test::b2;
+#endif
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mman.h>
@@ -21,6 +25,9 @@
 #include <algorithm>
 #include <utility>
 #include <stdexcept>
+#if defined(YARILO_B2_TEST_CONTROL)
+#include <sys/stat.h>
+#endif
 
 // Локальный RAII-guard для сокета, чтобы не зависеть от серверного core::UniqueFd
 struct ScopedFd {
@@ -40,6 +47,16 @@ struct TestConfig {
     int input_timeout_ms{500};
     int crash_after_commits{0};
     bool allow_dropped_frames{false};
+#if defined(YARILO_B2_TEST_CONTROL)
+    uint32_t surface_id{1};
+    int control_fd{-1};
+    uint32_t test_token{0};
+    bool recovery_mode{false};
+    bool start_paused{false};
+    bool pause_after_initial{false};
+    bool stop_after_recovery{false};
+    uint32_t initial_commits{20};
+#endif
 };
 
 
@@ -50,6 +67,12 @@ struct TestMetrics {
     uint64_t first_presented_seq{0};
     uint64_t confirmed_presented_count{0};
     uint32_t commits_sent_count{0};
+#if defined(YARILO_B2_TEST_CONTROL)
+    uint64_t recovery_resume_seq{0};
+    uint64_t recovery_presented_seq{0};
+    bool recovery_resume_received{false};
+    bool recovery_presentation_verified{false};
+#endif
 
     uint64_t motion_events_count{0};
     uint64_t inside_bounds_motion_count{0};
@@ -234,7 +257,7 @@ static bool receive_expected_packet(int sock_fd, yarilo::ipc::MessageType expect
     return true;
 }
 
-void run_test(const TestConfig& config, TestMetrics& metrics) {
+void run_test(TestConfig& config, TestMetrics& metrics) {
     const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
     if (!runtime_dir) {
         metrics.add_fail("XDG_RUNTIME_DIR not set");
@@ -272,7 +295,11 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
         metrics.add_fail("Encode CreateSurface failed"); 
         return; 
     }
+#if defined(YARILO_B2_TEST_CONTROL)
+    yarilo::ipc::write_le32(create_packet + yarilo::ipc::HEADER_SIZE, config.surface_id);
+#else
     yarilo::ipc::write_le32(create_packet + yarilo::ipc::HEADER_SIZE, 1);
+#endif
     
     if (::send(sock_fd, create_packet, sizeof(create_packet), MSG_NOSIGNAL) != sizeof(create_packet)) {
         metrics.add_fail("Send CreateSurface failed");
@@ -285,7 +312,11 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
     }
     
     uint32_t ack_surface_id = yarilo::ipc::read_le32(ack_payload.data());
+#if defined(YARILO_B2_TEST_CONTROL)
+    if (ack_surface_id != config.surface_id) {
+#else
     if (ack_surface_id != 1) {
+#endif
         metrics.add_fail("Invalid surface_id returned from server");
         return;
     }
@@ -315,7 +346,11 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
         if (!attach_hdr.encode(attach_packet)) return false;
 
         std::byte* p = attach_packet + yarilo::ipc::HEADER_SIZE;
+#if defined(YARILO_B2_TEST_CONTROL)
+        yarilo::ipc::write_le32(p + 0, config.surface_id);
+#else
         yarilo::ipc::write_le32(p + 0, 1);
+#endif
         yarilo::ipc::write_le32(p + 4, buffer_id);
         yarilo::ipc::write_le32(p + 8, W);
         yarilo::ipc::write_le32(p + 12, H);
@@ -352,8 +387,71 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
     int box_x = 50, box_y = 50;
     int box_vx = 6, box_vy = 4;
     constexpr int BOX_SIZE = 120;
+#if defined(YARILO_B2_TEST_CONTROL)
+    bool client_paused = config.start_paused && !config.pause_after_initial;
+    bool pre_crash_pause_sent = false;
+    bool recovery_mode_active = config.recovery_mode;
+    auto send_control_message = [&](uint32_t command) -> bool {
+        if (config.control_fd < 0) {
+            metrics.add_fail("send_control_message called without valid control_fd");
+            return false;
+        }
+        std::array<std::byte, 16> message{};
+        b2::put32(message.data(), 0x324C5443);
+        b2::put32(message.data() + 4, config.test_token);
+        b2::put32(message.data() + 8, command);
+        b2::put32(message.data() + 12, config.surface_id);
+        return ::send(config.control_fd, message.data(), message.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(message.size());
+    };
+    auto send_control_ack = [&](uint32_t command) -> bool {
+        return send_control_message(0x80000000U | command);
+    };
+#endif
 
-    pollfd pfd{.fd = sock_fd, .events = POLLIN, .revents = 0};
+    pollfd pfds[2]{};
+    nfds_t poll_fd_count = 1;
+    pfds[0] = pollfd{.fd = sock_fd, .events = POLLIN, .revents = 0};
+#if defined(YARILO_B2_TEST_CONTROL)
+    if (config.control_fd >= 0) {
+        pfds[1] = pollfd{.fd = config.control_fd, .events = POLLIN, .revents = 0};
+        poll_fd_count = 2;
+    }
+    auto next_control_command = [&]() -> bool {
+        if (config.control_fd < 0) return true;
+        std::array<std::byte, 16> message{};
+        const ssize_t n = ::recv(config.control_fd, message.data(), message.size(), MSG_DONTWAIT);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return true;
+        if (n != static_cast<ssize_t>(message.size()) || b2::get32(message.data()) != 0x324C5443 ||
+            b2::get32(message.data() + 4) != config.test_token) {
+            metrics.add_fail("Invalid test-control command framing/token");
+            return false;
+        }
+        const uint32_t command = b2::get32(message.data() + 8);
+        if (b2::get32(message.data() + 12) != config.surface_id) {
+            metrics.add_fail("Test-control surface identity mismatch");
+            return false;
+        }
+        if (command == 1 && !metrics.recovery_resume_received) {
+            client_paused = true;
+            if (!pre_crash_pause_sent) {
+                if (!send_control_ack(1)) {
+                    return false;
+                }
+                pre_crash_pause_sent = true;
+            }
+            return true; // Уже на паузе и ACK отправлен — дубликат не шлём
+        }
+        if (command == 2 && client_paused && !metrics.recovery_resume_received) {
+            client_paused = false;
+            recovery_mode_active = true;
+            metrics.recovery_resume_received = true;
+            metrics.recovery_resume_seq = metrics.current_seq + 1;
+            return true;
+        }
+        metrics.add_fail("Unexpected test-control command/state");
+        return false;
+    };
+#endif
 
     auto render_frame = [&](ClientBuffer& buf) {
         uint32_t* p = buf.pixels();
@@ -378,12 +476,28 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
 
     auto handle_incoming_events = [&](int timeout_ms) -> bool {
         while (true) {
-            int ret = ::poll(&pfd, 1, timeout_ms);
+            int ret = ::poll(pfds, poll_fd_count, timeout_ms);
             if (ret < 0 && errno == EINTR) continue;
             if (ret < 0) { metrics.add_fail("poll() error in event loop"); return false; }
+#if defined(YARILO_B2_TEST_CONTROL)
+            if (ret == 0) {
+                if (client_paused) {
+                    timeout_ms = 20;
+                    continue;
+                }
+                return true;
+            }
+            if (poll_fd_count == 2 && (pfds[1].revents & POLLIN)) {
+                if (!next_control_command()) return false;
+            }
+            if (poll_fd_count == 2 && (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                metrics.add_fail("test-control channel failed");
+                return false;
+            }
+#else
             if (ret == 0) return true;
-
-            if (pfd.revents & POLLIN) {
+#endif
+            if (pfds[0].revents & POLLIN) {
                 std::byte reply[256];
                 iovec iov{ .iov_base = reply, .iov_len = sizeof(reply) };
                 msghdr msg{};
@@ -433,7 +547,12 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                     const uint32_t buffer_id = yarilo::ipc::read_le32(payload + 4);
                     const uint64_t commit_seq = yarilo::ipc::read_le64(payload + 8);
 
-                    if (surface_id != 1 || buffer_id < 1 || buffer_id > 2) {
+#if defined(YARILO_B2_TEST_CONTROL)
+                    const uint32_t expected_surface_id = config.surface_id;
+#else
+                    const uint32_t expected_surface_id = 1;
+#endif
+                    if (surface_id != expected_surface_id || buffer_id < 1 || buffer_id > 2) {
                         metrics.add_fail("BufferReleased: invalid surface_id or buffer_id");
                         metrics.protocol_errors_count++; return false;
                     }
@@ -458,7 +577,12 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                     const uint32_t surface_id = yarilo::ipc::read_le32(payload);
                     const uint64_t commit_seq = yarilo::ipc::read_le64(payload + 4);
 
-                    if (surface_id != 1) {
+#if defined(YARILO_B2_TEST_CONTROL)
+                    const uint32_t expected_presented_surface_id = config.surface_id;
+#else
+                    const uint32_t expected_presented_surface_id = 1;
+#endif
+                    if (surface_id != expected_presented_surface_id) {
                         metrics.add_fail("FramePresented: invalid surface_id");
                         metrics.protocol_errors_count++; return false;
                     }
@@ -478,6 +602,13 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                         metrics.protocol_errors_count++;
                     } else {
                         metrics.confirmed_presented_count++;
+#if defined(YARILO_B2_TEST_CONTROL)
+                        if (recovery_mode_active && metrics.recovery_resume_received &&
+                            commit_seq >= metrics.recovery_resume_seq) {
+                            metrics.recovery_presentation_verified = true;
+                            metrics.recovery_presented_seq = commit_seq;
+                        }
+#endif
                         if (metrics.first_presented_seq == 0) {
                             metrics.first_presented_seq = commit_seq;
                         }
@@ -577,11 +708,15 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                 } else {
                     metrics.add_fail("Unexpected message type"); metrics.protocol_errors_count++; return false;
                 }
-            } else if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            } else if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 metrics.add_fail("Socket POLLERR/HUP"); 
                 return false;
             }
+#if defined(YARILO_B2_TEST_CONTROL)
+            timeout_ms = client_paused ? 20 : 0;
+#else
             timeout_ms = 0;
+#endif
         }
     };
 
@@ -592,7 +727,33 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
     };
 
     const int max_frames = (config.crash_after_commits > 0) ? config.crash_after_commits : 300;
+#if defined(YARILO_B2_TEST_CONTROL)
+    auto send_recovery_ready = [&]() -> bool {
+        if (!metrics.recovery_presentation_verified) return false;
+        return send_control_message(3);
+    };
+    if (config.start_paused && !config.pause_after_initial) {
+        if (!send_control_ack(1)) {
+            metrics.add_fail("Unable to report initial PAUSED state");
+            return;
+        }
+        pre_crash_pause_sent = true;
+        const auto pause_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!metrics.recovery_resume_received && std::chrono::steady_clock::now() < pause_deadline) {
+            if (!handle_incoming_events(20)) return;
+        }
+        if (!metrics.recovery_resume_received) {
+            metrics.add_fail("Timed out waiting for recovery RESUME command");
+            return;
+        }
+    }
+#endif
     for (int frame = 0; frame < max_frames; ++frame) {
+#if defined(YARILO_B2_TEST_CONTROL)
+        while (client_paused) {
+            if (!handle_incoming_events(20)) return;
+        }
+#endif
         auto deadline = get_client_deadline(frame + 1);
 
         box_x += box_vx; box_y += box_vy;
@@ -609,6 +770,11 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
                 return;
             }
         }
+#if defined(YARILO_B2_TEST_CONTROL)
+        while (client_paused) {
+            if (!handle_incoming_events(20)) return;
+        }
+#endif
 
         int target_idx = pool[0].is_available() ? 0 : 1;
         auto& buf = pool[target_idx];
@@ -632,7 +798,11 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
         }
 
         std::byte* p = commit_packet + yarilo::ipc::HEADER_SIZE;
+#if defined(YARILO_B2_TEST_CONTROL)
+        yarilo::ipc::write_le32(p + 0, config.surface_id);
+#else
         yarilo::ipc::write_le32(p + 0, 1);
+#endif
         yarilo::ipc::write_le32(p + 4, static_cast<uint32_t>(target_idx + 1));
         yarilo::ipc::write_le64(p + 8, seq);
 
@@ -646,6 +816,40 @@ void run_test(const TestConfig& config, TestMetrics& metrics) {
         if (deadline > now) {
             std::this_thread::sleep_for(deadline - now);
         }
+#if defined(YARILO_B2_TEST_CONTROL)
+        if (recovery_mode_active && metrics.recovery_resume_received && config.stop_after_recovery) {
+            const auto present_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!metrics.recovery_presentation_verified && std::chrono::steady_clock::now() < present_deadline) {
+                if (!handle_incoming_events(20)) return;
+            }
+            if (!metrics.recovery_presentation_verified) {
+                metrics.add_fail("No FramePresented for post-recovery commit");
+                return;
+            }
+            if (!send_recovery_ready()) {
+                metrics.add_fail("Failed to report post-recovery presentation to Runner");
+                return;
+            }
+            return;
+        }
+
+        if (config.pause_after_initial && metrics.commits_sent_count >= config.initial_commits && !pre_crash_pause_sent) {
+            client_paused = true;
+            if (!send_control_ack(1)) {
+                metrics.add_fail("Unable to send PAUSED_ACK to runner");
+                return;
+            }
+            pre_crash_pause_sent = true;
+            const auto pause_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (std::chrono::steady_clock::now() < pause_deadline && client_paused) {
+                if (!handle_incoming_events(20)) return;
+            }
+            if (client_paused) {
+                metrics.add_fail("Timed out waiting for recovery RESUME command");
+                return;
+            }
+        }
+#endif
     }
 
     if (config.crash_after_commits > 0) {
@@ -684,6 +888,58 @@ int main(int argc, char** argv) {
     // Строгий парсер аргументов
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
+#if defined(YARILO_B2_TEST_CONTROL)
+        if (arg == "--b2-recovery") {
+            config.recovery_mode = true;
+            config.start_paused = true;
+            config.stop_after_recovery = true;
+        } else if (arg == "--b2-initial-paused") {
+            config.start_paused = true;
+            config.pause_after_initial = true;
+        } else if (arg == "--b2-stop-after-recovery") {
+            config.stop_after_recovery = true;
+        } else if (arg == "--b2-surface-id") {
+            if (i + 1 >= argc) { std::println(stderr, "missing --b2-surface-id value"); return 2; }
+            std::string val = argv[++i];
+            if (val.empty() || !std::all_of(val.begin(), val.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) return 2;
+            size_t pos = 0;
+            try {
+                unsigned long parsed = std::stoul(val, &pos);
+                if (pos != val.length() || parsed == 0 || parsed > UINT32_MAX) return 2;
+                config.surface_id = static_cast<uint32_t>(parsed);
+            } catch (...) { return 2; }
+        } else if (arg == "--b2-control-fd") {
+            if (i + 1 >= argc) { std::println(stderr, "missing --b2-control-fd value"); return 2; }
+            std::string val = argv[++i];
+            if (val.empty() || !std::all_of(val.begin(), val.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) return 2;
+            size_t pos = 0;
+            try {
+                int parsed = std::stoi(val, &pos);
+                if (pos != val.length() || parsed < 0) return 2;
+                config.control_fd = parsed;
+            } catch (...) { return 2; }
+        } else if (arg == "--b2-token") {
+            if (i + 1 >= argc) { std::println(stderr, "missing --b2-token value"); return 2; }
+            std::string val = argv[++i];
+            if (val.empty() || !std::all_of(val.begin(), val.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) return 2;
+            size_t pos = 0;
+            try {
+                unsigned long long parsed = std::stoull(val, &pos);
+                if (pos != val.length() || parsed == 0 || parsed > UINT32_MAX) return 2;
+                config.test_token = parsed;
+            } catch (...) { return 2; }
+        } else if (arg == "--b2-initial-commits") {
+            if (i + 1 >= argc) { std::println(stderr, "missing --b2-initial-commits value"); return 2; }
+            std::string val = argv[++i];
+            if (val.empty() || !std::all_of(val.begin(), val.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) return 2;
+            size_t pos = 0;
+            try {
+                unsigned long parsed = std::stoul(val, &pos);
+                if (pos != val.length() || parsed == 0 || parsed > UINT32_MAX) return 2;
+                config.initial_commits = static_cast<uint32_t>(parsed);
+            } catch (...) { return 2; }
+        } else
+#endif
         if (arg == "--expect-motion") {
             config.expect_motion = true;
         } else if (arg == "--expect-no-motion") {
@@ -737,6 +993,26 @@ int main(int argc, char** argv) {
         }
     }
 
+#if defined(YARILO_B2_TEST_CONTROL)
+    const bool b2_flags_active = config.start_paused || config.pause_after_initial || 
+                                 config.stop_after_recovery || config.recovery_mode;
+    if (b2_flags_active && config.control_fd < 0) {
+        std::println(stderr, "Client Fatal: B2 control flags require a valid --b2-control-fd");
+        return 2;
+    }
+    if (config.control_fd >= 0) {
+        const int control_flags = ::fcntl(config.control_fd, F_GETFD);
+        if (control_flags < 0 || ::fcntl(config.control_fd, F_SETFD, control_flags | FD_CLOEXEC) != 0) {
+            std::println(stderr, "Client Fatal: invalid test control FD");
+            return 2;
+        }
+        if (config.test_token == 0) {
+            std::println(stderr, "Client Fatal: non-zero B2 control token is required when control_fd is provided");
+            return 2;
+        }
+    }
+#endif
+
     if (config.expect_motion && config.expect_no_motion) {
         std::println(stderr, "Client Fatal: --expect-motion and --expect-no-motion are mutually exclusive.");
         return 1;
@@ -751,6 +1027,13 @@ int main(int argc, char** argv) {
     run_test(config, metrics);
 
     // Валидация метрик после завершения сетевой фазы
+#if defined(YARILO_B2_TEST_CONTROL)
+    if (config.stop_after_recovery &&
+        (!metrics.recovery_resume_received || !metrics.recovery_presentation_verified ||
+         metrics.recovery_presented_seq < metrics.recovery_resume_seq)) {
+        metrics.add_fail("No valid post-recovery FramePresented for a new commit");
+    }
+#endif
     if (!config.allow_dropped_frames) {
         if (metrics.confirmed_presented_count != metrics.commits_sent_count) {
             metrics.add_fail(std::string("Frame presentation count mismatch: sent=") + 

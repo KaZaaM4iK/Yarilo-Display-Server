@@ -9,6 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
+#include <climits>
+#include <span>
+#include <sys/types.h>
+#include <sys/un.h>
 #include <poll.h>
 #include <signal.h>
 #include <string>
@@ -20,32 +25,69 @@ namespace b2 = yarilo::test::b2;
 
 namespace {
 
+constexpr uint32_t EVENT_MAGIC = 0x32455642; // BVE2
+constexpr uint16_t EVENT_VERSION = 1;
+constexpr uint16_t EVENT_READY = 1;
+constexpr uint16_t EVENT_REGISTERED = 2;
+constexpr uint16_t EVENT_BARRIER = 3;
+constexpr uint16_t EVENT_PASS = 4;
+constexpr uint16_t EVENT_FAIL = 5;
+constexpr size_t EVENT_READY_SIZE = 8;
+constexpr size_t EVENT_REGISTERED_SIZE = 8;
+constexpr size_t EVENT_BARRIER_SIZE = 40;
+constexpr size_t EVENT_RESULT_SIZE = 8;
+constexpr size_t EVENT_MAX_SIZE = EVENT_BARRIER_SIZE;
+static_assert(EVENT_MAX_SIZE <= PIPE_BUF, "B2 event records must be atomic pipe writes");
+
+void event_put16(std::byte* out, uint16_t value) noexcept {
+    out[0] = static_cast<std::byte>(value & 0xff);
+    out[1] = static_cast<std::byte>((value >> 8) & 0xff);
+}
+void event_put32(std::byte* out, uint32_t value) noexcept {
+    for (unsigned i = 0; i < 4; ++i) out[i] = static_cast<std::byte>((value >> (i * 8)) & 0xff);
+}
+void event_put64(std::byte* out, uint64_t value) noexcept {
+    for (unsigned i = 0; i < 8; ++i) out[i] = static_cast<std::byte>((value >> (i * 8)) & 0xff);
+}
+bool emit_event_record(int fd, uint16_t type, std::span<const std::byte> body) noexcept {
+    if (body.size() + 8 > EVENT_MAX_SIZE || body.size() + 8 > PIPE_BUF) return false;
+    std::array<std::byte, EVENT_MAX_SIZE> record{};
+    event_put32(record.data(), EVENT_MAGIC);
+    event_put16(record.data() + 4, EVENT_VERSION);
+    event_put16(record.data() + 6, type);
+    std::memcpy(record.data() + 8, body.data(), body.size());
+    const size_t size = body.size() + 8;
+    for (;;) {
+        const ssize_t written = ::write(fd, record.data(), size);
+        if (written == static_cast<ssize_t>(size)) return true;
+        if (written < 0 && errno == EINTR) continue;
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            pollfd pfd{.fd = fd, .events = POLLOUT, .revents = 0};
+            int rc;
+            do { rc = ::poll(&pfd, 1, 1000); } while (rc < 0 && errno == EINTR);
+            if (rc > 0 && (pfd.revents & POLLOUT)) continue;
+        }
+        return false;
+    }
+}
+
+bool emit_simple_event(int fd, uint16_t type) noexcept {
+    return emit_event_record(fd, type, {});
+}
+
 bool parse_positive(std::string_view text, long& value) {
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
     return error == std::errc{} && end == text.data() + text.size() && value > 0;
 }
 
 bool emit_event(int fd, std::string_view event) {
-    std::string line(event);
-    line.push_back('\n');
-    size_t offset = 0;
-    while (offset < line.size()) {
-        const ssize_t written = ::write(fd, line.data() + offset, line.size() - offset);
-        if (written > 0) {
-            offset += static_cast<size_t>(written);
-        } else if (written < 0 && errno == EINTR) {
-            continue;
-        } else if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            pollfd pfd{.fd = fd, .events = POLLOUT, .revents = 0};
-            int rc;
-            do { rc = ::poll(&pfd, 1, 1000); } while (rc < 0 && errno == EINTR);
-            if (rc > 0 && (pfd.revents & POLLOUT)) continue;
-            return false;
-        } else {
-            return false;
-        }
-    }
-    return true;
+    uint16_t type{};
+    if (event == "B2_COORDINATOR_READY") type = EVENT_READY;
+    else if (event == "B2_SERVER_REGISTERED") type = EVENT_REGISTERED;
+    else if (event == "B2_RESULT_PASS") type = EVENT_PASS;
+    else if (event == "B2_RESULT_FAIL") type = EVENT_FAIL;
+    else return false;
+    return emit_simple_event(fd, type);
 }
 
 struct Fd {
@@ -208,22 +250,123 @@ int main(int argc, char** argv) {
         registered = true;
     }
 
-    int exit_code = 1;
     const bool socket_clean = unlink_owned_socket();
-    if (registered && socket_clean) {
-        if (b2::send(peer.value, accepted_ack) && emit_event(event_fd, "B2_SERVER_REGISTERED")) {
-            // Registration ACK only; later stages implement the recovery state machine.
-            std::fprintf(stderr, "B2 Coordinator: server authenticated; recovery phases not yet implemented\n");
-            exit_code = 0;
-        } else {
-            std::fprintf(stderr, "B2 Coordinator: failed to deliver registration ACK or runner event\n");
-            (void)emit_event(event_fd, "B2_RESULT_FAIL");
-        }
-    } else {
+    if (!registered || !socket_clean || !b2::send(peer.value, accepted_ack) ||
+        !emit_event(event_fd, "B2_SERVER_REGISTERED")) {
         (void)emit_event(event_fd, "B2_RESULT_FAIL");
-        if (!registered)
-            std::fprintf(stderr, "B2 Coordinator: server registration failed or timed out\n");
+        std::fprintf(stderr, "B2 Coordinator: registration or ACK publication failed\n");
+        return 1;
     }
-    return exit_code;
+
+    enum class Phase { WaitDisconnect, WaitUnmapped, WaitRecoveryReady, WaitEof, Failed };
+    Phase phase = Phase::WaitDisconnect;
+    std::array<b2::Packet, 2> unmapped{};
+    std::array<bool, 2> recovery_ready{};
+    size_t unmapped_count = 0;
+    size_t recovery_count = 0;
+    uint64_t expected_seq = accepted_ack.message_seq + 1;
+    const uint64_t expected_server_uid = accepted_ack.uid;
+    const uint64_t expected_server_gid = accepted_ack.gid;
+    uint64_t epoch = 0;
+    auto packet_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+    bool barrier_emitted = false;
+
+    auto valid_server_packet = [&](const b2::Packet& packet) noexcept {
+        if (packet.message_seq != expected_seq || expected_seq == std::numeric_limits<uint64_t>::max()) return false;
+        ++expected_seq;
+        return packet.role == b2::Role::Server &&
+               packet.status == static_cast<uint32_t>(b2::Status::Ok) &&
+               packet.pid == static_cast<uint64_t>(expected_server_pid) &&
+               packet.server_pid == static_cast<uint64_t>(expected_server_pid) &&
+               packet.uid == expected_server_uid &&
+               packet.gid == expected_server_gid;
+    };
+
+    auto emit_barrier = [&]() noexcept {
+        std::array<std::byte, EVENT_BARRIER_SIZE - 8> body{};
+        event_put64(body.data(), epoch);
+        for (size_t i = 0; i < 2; ++i) {
+            event_put32(body.data() + 8 + i * 8, static_cast<uint32_t>(unmapped[i].session_id));
+            event_put32(body.data() + 12 + i * 8, static_cast<uint32_t>(unmapped[i].surface_id));
+        }
+        return !barrier_emitted && emit_event_record(event_fd, EVENT_BARRIER, body);
+    };
+
+    while (phase != Phase::Failed && phase != Phase::WaitEof) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= packet_deadline) { phase = Phase::Failed; break; }
+        const int timeout = static_cast<int>(std::max<int64_t>(1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(packet_deadline - now).count()));
+        pollfd pfd{.fd = peer.value, .events = POLLIN, .revents = 0};
+        const int ready = ::poll(&pfd, 1, timeout);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0 || (pfd.revents & (POLLERR | POLLNVAL))) { phase = Phase::Failed; break; }
+
+        bool saw_eof = false;
+        if (pfd.revents & (POLLIN | POLLHUP)) {
+            for (;;) {
+                b2::Packet packet{};
+                if (!b2::receive(peer.value, packet)) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == ECONNRESET) { saw_eof = true; break; }
+                    phase = Phase::Failed;
+                    break;
+                }
+                packet_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+                if (!valid_server_packet(packet)) { phase = Phase::Failed; break; }
+                if (phase == Phase::WaitDisconnect) {
+                    if (packet.type != b2::Type::WmDisconnected || packet.epoch != 1 ||
+                        packet.changed_count != 2 || packet.reported_count != 2) { phase = Phase::Failed; break; }
+                    epoch = packet.epoch;
+                    phase = Phase::WaitUnmapped;
+                } else if (phase == Phase::WaitUnmapped) {
+                    if (packet.type != b2::Type::SurfaceUnmapped || packet.epoch != epoch ||
+                        packet.session_id == 0 || packet.surface_id == 0 || packet.server_uid == 0 ||
+                        unmapped_count >= unmapped.size()) { phase = Phase::Failed; break; }
+                    bool duplicate = false;
+                    for (size_t i = 0; i < unmapped_count; ++i)
+                        if (unmapped[i].session_id == packet.session_id || unmapped[i].surface_id == packet.surface_id)
+                            duplicate = true;
+                    if (duplicate) { phase = Phase::Failed; break; }
+                    unmapped[unmapped_count++] = packet;
+                    if (unmapped_count == unmapped.size()) phase = Phase::WaitRecoveryReady;
+                } else if (phase == Phase::WaitRecoveryReady) {
+                    if (packet.type != b2::Type::SurfaceRecoveryReady || packet.epoch != epoch ||
+                        recovery_count >= recovery_ready.size()) { phase = Phase::Failed; break; }
+                    bool matched = false;
+                    for (size_t i = 0; i < unmapped.size(); ++i) {
+                        if (unmapped[i].session_id == packet.session_id && unmapped[i].surface_id == packet.surface_id &&
+                            unmapped[i].server_uid == packet.server_uid && !recovery_ready[i]) {
+                            recovery_ready[i] = true;
+                            ++recovery_count;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) { phase = Phase::Failed; break; }
+                    if (recovery_count == recovery_ready.size()) {
+                        if (!emit_barrier()) { phase = Phase::Failed; break; }
+                        barrier_emitted = true;
+                        phase = Phase::WaitEof;
+                    }
+                } else {
+                    phase = Phase::Failed;
+                    break;
+                }
+            }
+        }
+        if (phase == Phase::Failed) break;
+        if (saw_eof) {
+            if (phase == Phase::WaitEof && barrier_emitted && emit_event(event_fd, "B2_RESULT_PASS")) return 0;
+            phase = Phase::Failed;
+            break;
+        }
+        if ((pfd.revents & POLLHUP) && !saw_eof) { phase = Phase::Failed; break; }
+    }
+
+    (void)emit_event(event_fd, "B2_RESULT_FAIL");
+    std::fprintf(stderr, "B2 Coordinator: protocol failure, timeout, or premature EOF\n");
+    return 1;
 #endif
 }

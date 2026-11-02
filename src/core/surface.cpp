@@ -578,14 +578,33 @@ std::vector<MapRequestInfo> SurfaceManager::get_pending_map_requests() const {
     return requests;
 }
 
-void SurfaceManager::handle_wm_disconnected() noexcept {
+WmDisconnectReport SurfaceManager::handle_wm_disconnected(
+    std::span<UnmappedSurfaceInfo> output) noexcept
+{
+    WmDisconnectReport report{};
     for (auto& [gid, s] : surfaces_) {
         (void)gid;
-        s.is_mapped_by_wm = false;
+        if (s.is_mapped_by_wm) {
+            s.is_mapped_by_wm = false;
+            if (report.changed_count == std::numeric_limits<uint64_t>::max()) {
+                report.changed_count_overflow = true;
+            } else {
+                ++report.changed_count;
+            }
+            if (report.reported_count < output.size()) {
+                output[static_cast<size_t>(report.reported_count)] = UnmappedSurfaceInfo{
+                    .session_id = s.owner_session_id,
+                    .surface_id = s.local_id,
+                    .server_uid = s.server_uid,
+                };
+                ++report.reported_count;
+            }
+        }
         if (s.map_state == MapDeliveryState::Sent) {
             s.map_state = MapDeliveryState::Queued;
         }
     }
+    return report;
 }
 
 std::optional<platform::input::HitTestResult> SurfaceManager::hit_test(double cursor_x, double cursor_y) const noexcept {

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <array>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -49,6 +50,24 @@ public:
         const SurfaceManager& sm)
     {
         return sm.validate_lease_registry();
+    }
+
+    static void set_mapped(SurfaceManager& sm, uint32_t session_id, uint32_t local_id, bool mapped) {
+        const uint64_t gid = (static_cast<uint64_t>(session_id) << 32) | local_id;
+        auto it = sm.surfaces_.find(gid);
+        if (it != sm.surfaces_.end()) it->second.is_mapped_by_wm = mapped;
+    }
+
+    static void set_map_state(SurfaceManager& sm, uint32_t session_id, uint32_t local_id, MapDeliveryState state) {
+        const uint64_t gid = (static_cast<uint64_t>(session_id) << 32) | local_id;
+        auto it = sm.surfaces_.find(gid);
+        if (it != sm.surfaces_.end()) it->second.map_state = state;
+    }
+
+    static MapDeliveryState map_state(const SurfaceManager& sm, uint32_t session_id, uint32_t local_id) {
+        const uint64_t gid = (static_cast<uint64_t>(session_id) << 32) | local_id;
+        auto it = sm.surfaces_.find(gid);
+        return it == sm.surfaces_.end() ? MapDeliveryState::None : it->second.map_state;
     }
 };
 
@@ -240,6 +259,70 @@ bool test_client_crash_lease_drain()
 
 } // namespace
 
+bool test_wm_disconnect_span_capacity()
+{
+    SurfaceManager sm;
+    constexpr uint32_t session = 44;
+    constexpr uint32_t id1 = 1;
+    constexpr uint32_t id2 = 2;
+    constexpr uint32_t id3 = 3;
+    CHECK(sm.create_surface(session, id1).has_value());
+    CHECK(sm.create_surface(session, id2).has_value());
+    CHECK(sm.create_surface(session, id3).has_value());
+    SurfaceManagerTestAccess::set_mapped(sm, session, id1, true);
+    SurfaceManagerTestAccess::set_mapped(sm, session, id2, true);
+    SurfaceManagerTestAccess::set_mapped(sm, session, id3, true);
+    SurfaceManagerTestAccess::set_map_state(sm, session, id1, yarilo::core::MapDeliveryState::Sent);
+    SurfaceManagerTestAccess::set_map_state(sm, session, id2, yarilo::core::MapDeliveryState::Sent);
+    SurfaceManagerTestAccess::set_map_state(sm, session, id3, yarilo::core::MapDeliveryState::Sent);
+
+    const auto empty_report = sm.handle_wm_disconnected();
+    CHECK(empty_report.changed_count == 3);
+    CHECK(!empty_report.changed_count_overflow);
+    CHECK(empty_report.reported_count == 0);
+    CHECK(!sm.surface_is_mapped((static_cast<uint64_t>(session) << 32) | id1));
+    CHECK(!sm.surface_is_mapped((static_cast<uint64_t>(session) << 32) | id2));
+    CHECK(!sm.surface_is_mapped((static_cast<uint64_t>(session) << 32) | id3));
+    CHECK(SurfaceManagerTestAccess::map_state(sm, session, id1) == yarilo::core::MapDeliveryState::Queued);
+    CHECK(SurfaceManagerTestAccess::map_state(sm, session, id2) == yarilo::core::MapDeliveryState::Queued);
+    CHECK(SurfaceManagerTestAccess::map_state(sm, session, id3) == yarilo::core::MapDeliveryState::Queued);
+
+    SurfaceManagerTestAccess::set_mapped(sm, session, id1, true);
+    SurfaceManagerTestAccess::set_mapped(sm, session, id2, true);
+    SurfaceManagerTestAccess::set_mapped(sm, session, id3, true);
+    std::array<yarilo::core::UnmappedSurfaceInfo, 1> short_report{};
+    const auto short_result = sm.handle_wm_disconnected(short_report);
+    CHECK(short_result.changed_count == 3);
+    CHECK(!short_result.changed_count_overflow);
+    CHECK(short_result.reported_count == 1);
+    CHECK(short_report[0].session_id == session);
+    CHECK(short_report[0].surface_id >= id1 && short_report[0].surface_id <= id3);
+    CHECK(short_report[0].server_uid != 0);
+    CHECK(!sm.surface_is_mapped((static_cast<uint64_t>(session) << 32) | id1));
+    CHECK(!sm.surface_is_mapped((static_cast<uint64_t>(session) << 32) | id2));
+    CHECK(!sm.surface_is_mapped((static_cast<uint64_t>(session) << 32) | id3));
+
+    const auto repeat = sm.handle_wm_disconnected();
+    CHECK(repeat.changed_count == 0);
+    CHECK(repeat.reported_count == 0);
+
+    SurfaceManager mixed;
+    constexpr uint32_t mapped_session = 55;
+    constexpr uint32_t unmapped_session = 56;
+    CHECK(mixed.create_surface(mapped_session, 1).has_value());
+    CHECK(mixed.create_surface(unmapped_session, 1).has_value());
+    SurfaceManagerTestAccess::set_mapped(mixed, mapped_session, 1, true);
+    std::array<yarilo::core::UnmappedSurfaceInfo, 2> mixed_report{};
+    const auto mixed_result = mixed.handle_wm_disconnected(mixed_report);
+    CHECK(mixed_result.changed_count == 1);
+    CHECK(!mixed_result.changed_count_overflow);
+    CHECK(mixed_result.reported_count == 1);
+    CHECK(mixed_report[0].session_id == mapped_session);
+    CHECK(mixed_report[0].surface_id == 1);
+    CHECK(mixed_report[0].server_uid != 0);
+    return true;
+}
+
 bool test_wm_recovery()
 {
     std::cout << "[Test] WM Disconnect & Recovery State Machine\n";
@@ -284,9 +367,22 @@ bool test_wm_recovery()
     CHECK(snap1.has_value() && snap1->nodes.size() == 2);
     snap1->nodes.clear();
 
-    // 3. АВАРИЯ WM #1: handle_wm_disconnected
+    // 3. WM disconnect report: exact changes, identities, and idempotence.
     std::cout << "  -> Simulating WM #1 crash (handle_wm_disconnected)...\n";
-    sm.handle_wm_disconnected();
+    std::array<yarilo::core::UnmappedSurfaceInfo, 2> report_entries{};
+    const auto report = sm.handle_wm_disconnected(report_entries);
+    CHECK(report.changed_count == 2);
+    CHECK(report.reported_count == 2);
+    bool reported1 = false;
+    bool reported2 = false;
+    for (const auto& entry : report_entries) {
+        if (entry.session_id == SESS1 && entry.surface_id == SURF_ID && entry.server_uid == uid1) reported1 = true;
+        if (entry.session_id == SESS2 && entry.surface_id == SURF_ID && entry.server_uid == uid2) reported2 = true;
+    }
+    CHECK(reported1 && reported2);
+    const auto repeat_report = sm.handle_wm_disconnected();
+    CHECK(repeat_report.changed_count == 0);
+    CHECK(repeat_report.reported_count == 0);
 
     // Инвариант 1: Поверхности не уничтожены, но сняты с экрана
     CHECK(sm.surface_exists(GID1));
@@ -334,6 +430,9 @@ int main()
 {
     try {
         if (!test_client_crash_lease_drain()) {
+            return 1;
+        }
+        if (!test_wm_disconnect_span_capacity()) {
             return 1;
         }
     } catch (const std::exception& e) {

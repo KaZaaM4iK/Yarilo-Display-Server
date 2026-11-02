@@ -10,22 +10,19 @@
 #include <utility>
 #include <limits>
 #include <type_traits>
+#include <span>
 
 namespace yarilo::core {
 
-// КОНТРАКТ ПОТОКОВОЙ МОДЕЛИ:
-// Класс SurfaceManager строго однопоточен (Single-Threaded Reactor). 
-// Все методы вызываются исключительно из главного потока событий сервера.
-
 enum class BufferUsage {
-    None,      // Не привязан к коммитам
-    Pending,   // Удерживается в очереди pending_commit
-    Active     // Удерживается в active_commit
+    None,
+    Pending,
+    Active
 };
 
 enum class BindingReleaseState {
-    Retained,  // Удерживается сервером
-    Released   // Логическое освобождение зафиксировано, сформирован ReleaseInfo
+    Retained,
+    Released
 };
 
 struct BufferBinding {
@@ -57,6 +54,14 @@ enum class MapDeliveryState {
 
 class Surface {
 public:
+    Surface() = default;
+    Surface(uint64_t s_uid, uint64_t g_id, uint32_t l_id, uint32_t sess_id, uint64_t c_order)
+        : server_uid(s_uid),
+          global_id(g_id),
+          local_id(l_id),
+          owner_session_id(sess_id),
+          creation_order(c_order) {}
+
     uint64_t server_uid{0};
     uint64_t global_id{0};
     uint32_t local_id{0};
@@ -133,6 +138,18 @@ struct ActiveLease {
     uint64_t binding_uid{0};
 };
 
+struct UnmappedSurfaceInfo {
+    uint32_t session_id;
+    uint32_t surface_id;
+    uint64_t server_uid;
+};
+
+struct WmDisconnectReport {
+    uint64_t changed_count{0};
+    uint64_t reported_count{0};
+    bool changed_count_overflow{false};
+};
+
 static_assert(
     std::is_nothrow_copy_assignable_v<std::optional<QueuedCommit>>,
     "std::optional<QueuedCommit> copy assignment must be noexcept for snapshot phase 3"
@@ -154,7 +171,6 @@ static_assert(
 );
 
 class SurfaceManagerTestAccess;
-
 class SurfaceManager {
 public:
     core::Result<void> create_surface(uint32_t session_id, uint32_t local_id);
@@ -170,42 +186,30 @@ public:
 
     void mark_map_request_sent(uint64_t global_id, uint64_t server_uid) noexcept;
     std::vector<MapRequestInfo> get_pending_map_requests() const;
-    void handle_wm_disconnected() noexcept;
+    WmDisconnectReport handle_wm_disconnected(
+        std::span<UnmappedSurfaceInfo> output = {}) noexcept;
 
     core::Result<void> apply_wm_configuration(uint64_t global_id, uint64_t server_uid, int32_t x, int32_t y, 
                                               uint32_t z, bool mapped);
 
-    // Strong Exception Guarantee: атомарная фиксация снимка
-    core::Result<SnapshotResult> take_render_snapshot();
+    // Поддержка подсистемы ввода: Zero-Allocation Hit-Testing
+    [[nodiscard]] std::optional<platform::input::HitTestResult> hit_test(double cursor_x, double cursor_y) const noexcept;
+    [[nodiscard]] std::optional<std::pair<int32_t, int32_t>> get_surface_origin(uint64_t gid) const noexcept;
+    [[nodiscard]] bool surface_exists(uint64_t gid) const noexcept;
+    [[nodiscard]] bool surface_is_mapped(uint64_t gid) const noexcept;
 
+    core::Result<SnapshotResult> take_render_snapshot();
     std::optional<ReleaseInfo> release_read_lease(uint64_t lease_id) noexcept;
 
-    [[nodiscard]]
-    std::optional<platform::input::HitTestResult>
-    hit_test(double cursor_x, double cursor_y) const noexcept;
-
-    [[nodiscard]]
-    std::optional<std::pair<int32_t, int32_t>>
-    get_surface_origin(uint64_t gid) const noexcept;
-
-    [[nodiscard]]
-    bool surface_exists(uint64_t gid) const noexcept;
-
-    [[nodiscard]]
-    bool surface_is_mapped(uint64_t gid) const noexcept;
-
 private:
-    friend class SurfaceManagerTestAccess;
-
     core::Result<void> validate_surface_graph_invariants(const Surface& s) const;
     std::optional<ReleaseInfo> try_release_binding(uint64_t binding_uid) noexcept;
-
-    // Диагностическая проверка согласованности реестра аренд (для тестов и отладки)
     core::Result<void> validate_lease_registry() const;
 
     std::unordered_map<uint64_t, Surface> surfaces_;
     std::unordered_map<uint64_t, BufferBinding> bindings_;
     std::unordered_map<uint64_t, ActiveLease> active_leases_;
+    friend class SurfaceManagerTestAccess;
     
     uint64_t global_creation_counter_{0};
     uint64_t server_uid_counter_{0};
