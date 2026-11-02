@@ -5,6 +5,9 @@
 #include "core/surface.hpp"
 #include "core/geometry.hpp"
 #include "server/orchestration.hpp"
+#if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
+#include "server/b2_server_transport.hpp"
+#endif
 #include "shm/validator.hpp"
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
 #include "test/b2_control.hpp"
@@ -247,9 +250,7 @@ int main() {
 
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
     constexpr uint64_t B2_REGISTER_MESSAGE_SEQ = 1;
-    std::array<b2::Packet, 8> b2_out_queue{};
-    size_t b2_out_queue_head{0};
-    size_t b2_out_queue_count{0};
+    yarilo::server::B2PacketQueue<8> b2_out_queue{};
     std::optional<size_t> b2_poll_index;
     int b2_coordinator_fd{-1};
     uint64_t b2_message_seq{B2_REGISTER_MESSAGE_SEQ};
@@ -260,32 +261,15 @@ int main() {
             mark_b2_failed("B2 queue flush without Coordinator connection");
             return false;
         }
-        while (b2_out_queue_count > 0) {
-            const b2::Packet& packet = b2_out_queue[b2_out_queue_head];
-            if (!b2::send(b2_coordinator_fd, packet)) {
+        while (!b2_out_queue.empty()) {
+            const b2::Packet* packet = b2_out_queue.peek();
+            if (!packet) break;
+            if (!b2::send(b2_coordinator_fd, *packet)) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return true;
                 mark_b2_failed("B2 send failed");
                 return false;
             }
-            b2_out_queue_head = (b2_out_queue_head + 1) % b2_out_queue.size();
-            --b2_out_queue_count;
-        }
-        return true;
-    };
-
-    auto b2_can_enqueue = [&](size_t count) noexcept {
-        return count <= b2_out_queue.size() - b2_out_queue_count;
-    };
-
-    auto b2_enqueue_batch = [&](std::span<const b2::Packet> packets) -> bool {
-        if (packets.size() > b2_out_queue.size() - b2_out_queue_count) {
-            mark_b2_failed("B2 out queue cannot atomically fit packet batch");
-            return false;
-        }
-        for (const auto& packet : packets) {
-            const size_t tail = (b2_out_queue_head + b2_out_queue_count) % b2_out_queue.size();
-            b2_out_queue[tail] = packet;
-            ++b2_out_queue_count;
+            b2_out_queue.drop_head();
         }
         return true;
     };
@@ -295,7 +279,7 @@ int main() {
             mark_b2_failed("attempted to enqueue B2 packet after drain began");
             return false;
         }
-        return b2_enqueue_batch(std::span<const b2::Packet>(&packet, 1));
+        return b2_out_queue.push(packet);
     };
 
 #endif
@@ -438,13 +422,9 @@ int main() {
                 break;
             }
         }
-        if (!ack_received || register_ack.type != b2::Type::Register ||
-            register_ack.role != b2::Role::Coordinator ||
-            register_ack.status != static_cast<uint32_t>(b2::Status::Ok) ||
-            register_ack.message_seq != register_request.message_seq ||
-            register_ack.pid != static_cast<uint64_t>(coordinator_pid) ||
-            register_ack.uid != static_cast<uint64_t>(coordinator_uid) ||
-            register_ack.gid != static_cast<uint64_t>(coordinator_gid)) {
+        if (!ack_received || !yarilo::server::verify_coordinator_ack(
+                register_ack, register_request.message_seq,
+                coordinator_pid, coordinator_uid, coordinator_gid)) {
             mark_b2_failed("Register ACK invalid or timeout");
             exit_code = 1;
             goto server_teardown;
@@ -731,7 +711,7 @@ int main() {
                 b2_shutdown_requested = true;
                 b2_queue_drain_deadline = std::chrono::steady_clock::now() + B2_DRAIN_TIMEOUT;
                 server_socket.reset(); // stop accepting IPC clients during B2 drain
-                if (b2_out_queue_count == 0) {
+                if (b2_out_queue.empty()) {
                     b2_drain_complete = true;
                     break;
                 }
@@ -767,7 +747,7 @@ int main() {
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
             if (b2_coordinator_fd >= 0) {
                 short b2_ev = POLLIN;
-                if (b2_out_queue_count > 0) b2_ev |= POLLOUT;
+                if (!b2_out_queue.empty()) b2_ev |= POLLOUT;
                 b2_poll_index = pfds.size();
                 pfds.push_back(pollfd{ .fd = b2_coordinator_fd, .events = b2_ev, .revents = 0 });
             } else {
@@ -777,7 +757,7 @@ int main() {
 
             int poll_timeout_ms = 20;
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
-            if (b2_drain_mode && b2_out_queue_count > 0) {
+            if (b2_drain_mode && !b2_out_queue.empty()) {
                 const auto drain_left = std::chrono::duration_cast<std::chrono::milliseconds>(
                     b2_queue_drain_deadline - std::chrono::steady_clock::now()).count();
                 poll_timeout_ms = static_cast<int>(std::min<int64_t>(poll_timeout_ms, std::max<int64_t>(1, drain_left)));
@@ -875,12 +855,12 @@ int main() {
                     exit_code = 1;
                     goto server_teardown;
                 }
-                if ((b2_revents & POLLOUT) && b2_out_queue_count > 0) {
+                if ((b2_revents & POLLOUT) && !b2_out_queue.empty()) {
                     if (!b2_flush_queue()) {
                         exit_code = 1;
                         goto server_teardown;
                     }
-                    if (b2_drain_mode && b2_out_queue_count == 0) {
+                    if (b2_drain_mode && b2_out_queue.empty()) {
                         b2_drain_complete = true;
                         break;
                     }
@@ -1112,12 +1092,14 @@ int main() {
                         }
                     } else if (sess.role == ClientRole::WindowManager) {
                         if (packet.header.type == yarilo::ipc::MessageType::WmConfigureSurface) {
-                            auto p = yarilo::ipc::WmConfigureSurfacePayload::decode(
-                                std::span<const std::byte>(packet.payload.data(), packet.payload_len));
-                            if (p) {
-                                bool was_mapped = surface_manager.surface_is_mapped(p->global_surface_id);
-                                auto conf_res = surface_manager.apply_wm_configuration(
-                                    p->global_surface_id, p->server_uid, p->x, p->y, p->z_index, p->mapped != 0);
+                        auto p = yarilo::ipc::WmConfigureSurfacePayload::decode(
+                            std::span<const std::byte>(packet.payload.data(), packet.payload_len));
+                        if (p) {
+#if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
+                            bool was_mapped = surface_manager.surface_is_mapped(p->global_surface_id);
+#endif
+                            auto conf_res = surface_manager.apply_wm_configuration(
+                                p->global_surface_id, p->server_uid, p->x, p->y, p->z_index, p->mapped != 0);
                                 if (conf_res) {
                                     if (p->mapped == 0) {
                                         auto clr_res = input_subsystem->clear_keyboard_focus_for_surface(p->global_surface_id, input_callbacks);
@@ -1130,34 +1112,25 @@ int main() {
                                     }
                                     trigger_repaint();
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
-                                    if (!was_mapped && p->mapped != 0) {
+                                    if (!b2_drain_mode && !b2_shutdown_requested &&
+                                        b2_recovery_report_active && active_wm_session_id.has_value()) {
                                         for (size_t rec_index = 0; rec_index < b2_unmapped_report.size(); ++rec_index) {
-                                            const auto& rec = b2_unmapped_report[rec_index];
-                                            if (!b2_drain_mode && !b2_shutdown_requested &&
-                                                b2_recovery_report_active && !b2_recovery_ready_queued[rec_index] &&
-                                                active_wm_session_id.has_value() && *active_wm_session_id == sess.session_id &&
-                                                surface_manager.surface_is_mapped(p->global_surface_id) &&
-                                                rec.session_id == static_cast<uint32_t>(p->global_surface_id >> 32) &&
-                                                rec.surface_id == static_cast<uint32_t>(p->global_surface_id & 0xFFFFFFFFULL) &&
-                                                rec.server_uid == p->server_uid) {
+                                            if (yarilo::server::should_queue_recovery_ready(
+                                                    was_mapped, p->mapped != 0, b2_recovery_report_active,
+                                                    b2_recovery_ready_queued[rec_index], *active_wm_session_id,
+                                                    sess.session_id, p->global_surface_id, p->server_uid,
+                                                    b2_unmapped_report[rec_index])) {
                                                 b2::Packet recovery_pkt{};
-                                                recovery_pkt.type = b2::Type::SurfaceRecoveryReady;
-                                                recovery_pkt.role = b2::Role::Server;
-                                                recovery_pkt.status = static_cast<uint32_t>(b2::Status::Ok);
-                                                if (b2_message_seq == std::numeric_limits<uint64_t>::max()) {
+                                                if (!yarilo::server::prepare_recovery_ready_packet(
+                                                        recovery_epoch, b2_message_seq, ::getpid(),
+                                                        ::getuid(), ::getgid(),
+                                                        static_cast<uint32_t>(p->global_surface_id >> 32),
+                                                        static_cast<uint32_t>(p->global_surface_id & 0xFFFFFFFFULL),
+                                                        p->server_uid, recovery_pkt)) {
                                                     mark_b2_failed("B2 message_seq overflow for SurfaceRecoveryReady");
                                                     exit_code = 1;
                                                     goto server_teardown;
                                                 }
-                                                recovery_pkt.message_seq = b2_message_seq + 1;
-                                                recovery_pkt.pid = static_cast<uint64_t>(::getpid());
-                                                recovery_pkt.uid = static_cast<uint64_t>(::getuid());
-                                                recovery_pkt.gid = static_cast<uint64_t>(::getgid());
-                                                recovery_pkt.server_pid = static_cast<uint64_t>(::getpid());
-                                                recovery_pkt.epoch = recovery_epoch;
-                                                recovery_pkt.session_id = static_cast<uint32_t>(p->global_surface_id >> 32);
-                                                recovery_pkt.surface_id = static_cast<uint32_t>(p->global_surface_id & 0xFFFFFFFFULL);
-                                                recovery_pkt.server_uid = p->server_uid;
                                                 if (!b2_queue_packet(recovery_pkt)) {
                                                     exit_code = 1;
                                                     goto server_teardown;
@@ -1314,54 +1287,19 @@ int main() {
                             [&]() noexcept {
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
                                 b2_disconnect_report = surface_manager.handle_wm_disconnected(b2_unmapped_report);
-                                if (b2_disconnect_report.changed_count_overflow ||
-                                    b2_disconnect_report.changed_count != B2_EXPECTED_SURFACE_COUNT ||
-                                    b2_disconnect_report.reported_count != B2_EXPECTED_SURFACE_COUNT) {
-                                    mark_b2_failed("disconnect report count mismatch");
+                                std::array<b2::Packet, yarilo::server::B2_DISCONNECT_BATCH_SIZE> batch{};
+                                if (b2_drain_mode || b2_shutdown_requested ||
+                                    !b2_out_queue.can_enqueue(batch.size()) ||
+                                    !yarilo::server::prepare_disconnect_batch(
+                                        recovery_epoch, b2_disconnect_report, b2_unmapped_report,
+                                        b2_message_seq, ::getpid(), ::getuid(), ::getgid(), batch)) {
+                                    mark_b2_failed("cannot prepare or atomically enqueue disconnect report batch");
+                                } else if (!b2_out_queue.push_batch(batch)) {
+                                    mark_b2_failed("atomic disconnect report enqueue failed");
                                 } else {
-                                    constexpr size_t DISCONNECT_BATCH_SIZE = 1 + B2_EXPECTED_SURFACE_COUNT;
-                                    if (b2_drain_mode || b2_shutdown_requested ||
-                                        !b2_can_enqueue(DISCONNECT_BATCH_SIZE) ||
-                                        DISCONNECT_BATCH_SIZE > std::numeric_limits<uint64_t>::max() - b2_message_seq) {
-                                        mark_b2_failed("cannot reserve complete disconnect report FIFO/sequence range");
-                                    } else {
-                                        std::array<b2::Packet, DISCONNECT_BATCH_SIZE> batch{};
-                                        batch[0].type = b2::Type::WmDisconnected;
-                                        batch[0].role = b2::Role::Server;
-                                        batch[0].status = static_cast<uint32_t>(b2::Status::Ok);
-                                        batch[0].pid = static_cast<uint64_t>(::getpid());
-                                        batch[0].uid = static_cast<uint64_t>(::getuid());
-                                        batch[0].gid = static_cast<uint64_t>(::getgid());
-                                        batch[0].server_pid = static_cast<uint64_t>(::getpid());
-                                        batch[0].epoch = recovery_epoch;
-                                        batch[0].changed_count = b2_disconnect_report.changed_count;
-                                        batch[0].reported_count = b2_disconnect_report.reported_count;
-                                        for (size_t i = 0; i < B2_EXPECTED_SURFACE_COUNT; ++i) {
-                                            auto& packet = batch[i + 1];
-                                            const auto& record = b2_unmapped_report[i];
-                                            packet.type = b2::Type::SurfaceUnmapped;
-                                            packet.role = b2::Role::Server;
-                                            packet.status = static_cast<uint32_t>(b2::Status::Ok);
-                                            packet.pid = static_cast<uint64_t>(::getpid());
-                                            packet.uid = static_cast<uint64_t>(::getuid());
-                                            packet.gid = static_cast<uint64_t>(::getgid());
-                                            packet.server_pid = static_cast<uint64_t>(::getpid());
-                                            packet.epoch = recovery_epoch;
-                                            packet.session_id = record.session_id;
-                                            packet.surface_id = record.surface_id;
-                                            packet.server_uid = record.server_uid;
-                                        }
-                                        const uint64_t first_sequence = b2_message_seq + 1;
-                                        for (size_t i = 0; i < batch.size(); ++i)
-                                            batch[i].message_seq = first_sequence + static_cast<uint64_t>(i);
-                                        if (!b2_enqueue_batch(batch)) {
-                                            mark_b2_failed("atomic disconnect report enqueue failed");
-                                        } else {
-                                            b2_message_seq += static_cast<uint64_t>(DISCONNECT_BATCH_SIZE);
-                                            b2_recovery_report_active = true;
-                                            b2_recovery_ready_queued.fill(false);
-                                        }
-                                    }
+                                    b2_message_seq += batch.size();
+                                    b2_recovery_report_active = true;
+                                    b2_recovery_ready_queued.fill(false);
                                 }
 #endif
                             },
@@ -1457,7 +1395,7 @@ server_teardown:
 
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
     if (b2_registered && b2_coordinator_fd >= 0) {
-        if (!b2_drain_mode || !b2_drain_complete || b2_out_queue_count != 0 || b2_test_failed) {
+        if (!b2_drain_mode || !b2_drain_complete || !b2_out_queue.empty() || b2_test_failed) {
             mark_b2_failed("B2 teardown without successful graceful drain");
             exit_code = 1;
         }
@@ -1547,6 +1485,14 @@ server_teardown:
     }
 
 #if defined(__linux__) && defined(YARILO_B2_TEST_CONTROL)
+    if (b2_registered && b2_coordinator_fd >= 0) {
+        if (!b2_drain_mode || !b2_drain_complete || !b2_out_queue.empty() || b2_test_failed) {
+            mark_b2_failed("B2 teardown without successful graceful drain");
+            exit_code = 1;
+        }
+        ::close(b2_coordinator_fd);
+        b2_coordinator_fd = -1;
+    }
     if (b2_test_failed && exit_code == 0) exit_code = 1;
 #endif
     return exit_code;

@@ -926,7 +926,7 @@ int main(int argc, char** argv) {
             try {
                 unsigned long long parsed = std::stoull(val, &pos);
                 if (pos != val.length() || parsed == 0 || parsed > UINT32_MAX) return 2;
-                config.test_token = parsed;
+                config.test_token = static_cast<uint32_t>(parsed);
             } catch (...) { return 2; }
         } else if (arg == "--b2-initial-commits") {
             if (i + 1 >= argc) { std::println(stderr, "missing --b2-initial-commits value"); return 2; }
